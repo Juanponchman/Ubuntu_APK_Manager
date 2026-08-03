@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -78,12 +79,15 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import cn.termux.ubuntumanager.data.UbuntuRepository
 import cn.termux.ubuntumanager.BuildConfig
+import cn.termux.ubuntumanager.command.TerminalKeys
 import cn.termux.ubuntumanager.command.TerminalShortcuts
+import cn.termux.ubuntumanager.command.actionSummary
 import cn.termux.ubuntumanager.model.AppUiState
 import cn.termux.ubuntumanager.model.BackupEntry
 import cn.termux.ubuntumanager.model.BackgroundOperationStatus
@@ -93,10 +97,11 @@ import cn.termux.ubuntumanager.model.EnvironmentStatus
 import cn.termux.ubuntumanager.model.InstanceRuntimeState
 import cn.termux.ubuntumanager.model.TerminalShortcutAction
 import cn.termux.ubuntumanager.model.TerminalShortcutPreference
-import cn.termux.ubuntumanager.model.TermuxWakeLockState
+import cn.termux.ubuntumanager.model.TerminalKeyStroke
 import cn.termux.ubuntumanager.model.UbuntuInstance
 import cn.termux.ubuntumanager.model.UserCommand
-import cn.termux.ubuntumanager.proot.ProotDistroClient
+import cn.termux.ubuntumanager.model.UserCommandType
+import cn.termux.ubuntumanager.chroot.ChrootClient
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -107,19 +112,16 @@ fun InstancesScreen(
     state: AppUiState,
     onRequestAlphaSetup: () -> Unit,
     alphaSetupInProgress: Boolean,
-    onOpenTermux: () -> Unit,
     onRefresh: () -> Unit,
-    onStart: (String) -> Unit,
     onSession: (String) -> Unit,
     onDetails: (String) -> Unit,
 ) {
     when {
-        state.environment.checking -> LoadingState("正在检查 Termux 环境…")
+        state.environment.checking -> LoadingState("正在检查 Alpha Root 与 Chroot 环境…")
         !state.environment.ready -> EnvironmentSetup(
             environment = state.environment,
             onRequestAlphaSetup = onRequestAlphaSetup,
             alphaSetupInProgress = alphaSetupInProgress,
-            onOpenTermux = onOpenTermux,
             onRefresh = onRefresh,
         )
         else -> LazyColumn(
@@ -141,7 +143,6 @@ fun InstancesScreen(
                     InstanceCard(
                         instance = instance,
                         enabled = state.currentOperation == null,
-                        onStart = { onStart(instance.name) },
                         onSession = { onSession(instance.name) },
                         onDetails = { onDetails(instance.name) },
                     )
@@ -166,15 +167,15 @@ private fun EnvironmentSummary(environment: EnvironmentStatus) {
             )
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text("Termux 已连接", fontWeight = FontWeight.SemiBold)
+                Text("Root Chroot 已连接", fontWeight = FontWeight.SemiBold)
                 Text(
-                    "Termux ${environment.termuxVersion ?: "未知"} · PRoot Distro ${environment.prootVersion ?: "未知"}",
+                    "Magisk Alpha ${environment.alphaVersion ?: "未知"} · ${environment.backendVersion ?: "Chroot 未知"}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
-        if (!environment.storageReady) {
+        if (!environment.backupReady) {
             HorizontalDivider()
             Row(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
@@ -221,7 +222,6 @@ private fun OperationCard(label: String) {
 private fun InstanceCard(
     instance: UbuntuInstance,
     enabled: Boolean,
-    onStart: () -> Unit,
     onSession: () -> Unit,
     onDetails: () -> Unit,
 ) {
@@ -229,74 +229,143 @@ private fun InstanceCard(
         modifier = Modifier.fillMaxWidth(),
         onClick = onDetails,
     ) {
-        Column(Modifier.padding(14.dp)) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(9.dp),
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     instance.name,
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 )
                 if (instance.isProtected) {
-                    AssistChip(
-                        onClick = onDetails,
-                        label = { Text("受保护") },
-                        leadingIcon = {
-                            Icon(
-                                Icons.Default.Lock,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                        },
+                    Icon(
+                        Icons.Default.Lock,
+                        contentDescription = "受保护",
+                        modifier = Modifier
+                            .padding(horizontal = 6.dp)
+                            .size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                InstanceStatusTag(instance.state)
             }
-            Spacer(Modifier.height(6.dp))
-            RuntimeStatus(instance)
-            Spacer(Modifier.height(8.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        "SSH 端口：${instance.sshPort}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    instance.hostAddress?.let { address ->
-                        Text(
-                            "$address:${instance.sshPort}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
+                Text(
+                    "SSH",
+                    modifier = Modifier
+                        .background(
+                            MaterialTheme.colorScheme.secondaryContainer,
+                            RoundedCornerShape(7.dp),
                         )
-                    }
-                }
+                        .padding(horizontal = 7.dp, vertical = 3.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    "${instance.hostAddress ?: "127.0.0.1"}:${instance.sshPort}",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
                 if (
+                    instance.state == InstanceRuntimeState.STOPPED ||
                     instance.state == InstanceRuntimeState.RUNNING ||
                     instance.state == InstanceRuntimeState.SSH_READY
                 ) {
-                    Button(onClick = onSession, enabled = enabled) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
+                    Button(
+                        onClick = onSession,
+                        enabled = enabled,
+                        modifier = Modifier.height(40.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            horizontal = 12.dp,
+                        ),
+                    ) {
+                        Icon(
+                            Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
                         Text("进入会话")
                     }
-                } else if (instance.state == InstanceRuntimeState.STOPPED) {
-                    Button(onClick = onStart, enabled = enabled) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("启动")
-                    }
                 } else {
-                    Button(onClick = {}, enabled = false) {
-                        Text("状态未知")
+                    Button(
+                        onClick = {},
+                        enabled = false,
+                        modifier = Modifier.height(40.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            horizontal = 12.dp,
+                        ),
+                    ) {
+                        Text("进入会话")
                     }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun InstanceStatusTag(state: InstanceRuntimeState) {
+    val (label, contentColor, containerColor) = when (state) {
+        InstanceRuntimeState.CHECKING -> Triple(
+            "检查中",
+            MaterialTheme.colorScheme.tertiary,
+            MaterialTheme.colorScheme.tertiaryContainer,
+        )
+        InstanceRuntimeState.STOPPED -> Triple(
+            "已停止",
+            MaterialTheme.colorScheme.onSurfaceVariant,
+            MaterialTheme.colorScheme.surfaceVariant,
+        )
+        InstanceRuntimeState.RUNNING -> Triple(
+            "运行中",
+            MaterialTheme.colorScheme.onTertiaryContainer,
+            MaterialTheme.colorScheme.tertiaryContainer,
+        )
+        InstanceRuntimeState.SSH_READY -> Triple(
+            "SSH 正常",
+            Color(0xFF1B5E20),
+            Color(0xFFE2F4E3),
+        )
+        InstanceRuntimeState.OPERATING -> Triple(
+            "操作中",
+            MaterialTheme.colorScheme.onPrimaryContainer,
+            MaterialTheme.colorScheme.primaryContainer,
+        )
+        InstanceRuntimeState.UNKNOWN -> Triple(
+            "状态未知",
+            MaterialTheme.colorScheme.onErrorContainer,
+            MaterialTheme.colorScheme.errorContainer,
+        )
+        InstanceRuntimeState.ERROR -> Triple(
+            "运行异常",
+            MaterialTheme.colorScheme.onErrorContainer,
+            MaterialTheme.colorScheme.errorContainer,
+        )
+    }
+    Text(
+        label,
+        modifier = Modifier
+            .background(containerColor, RoundedCornerShape(8.dp))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.labelMedium,
+        color = contentColor,
+        fontWeight = FontWeight.SemiBold,
+        maxLines = 1,
+    )
 }
 
 @Composable
@@ -354,7 +423,6 @@ private fun EnvironmentSetup(
     environment: EnvironmentStatus,
     onRequestAlphaSetup: () -> Unit,
     alphaSetupInProgress: Boolean,
-    onOpenTermux: () -> Unit,
     onRefresh: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -365,66 +433,44 @@ private fun EnvironmentSetup(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("完成连接设置", style = MaterialTheme.typography.headlineSmall)
+        Text("完成 Root Chroot 设置", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "管理器只通过 Termux 官方 RUN_COMMAND 接口执行预定义操作。",
+            "管理器通过 Magisk Alpha 运行固定的 Chroot 管理操作，不依赖 Termux。",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         SetupStep(
-            title = "1. 安装官方 Termux",
-            completed = environment.termuxInstalled,
-            description = environment.termuxVersion?.let { "已检测到版本 $it" }
-                ?: "需要包名为 com.termux 的官方版本",
-            actionText = if (environment.termuxInstalled) null else "打开下载页面",
-            onAction = {
-                context.startActivity(
-                    Intent(
-                        Intent.ACTION_VIEW,
-                        Uri.parse("https://github.com/termux/termux-app/releases"),
-                    ),
-                )
-            },
+            title = "1. 检查 Magisk Alpha",
+            completed = environment.alphaInstalled,
+            description = environment.alphaVersion?.let { "已检测到 Magisk Alpha $it" }
+                ?: "需要 io.github.vvb2060.magisk 的 Alpha 版本",
+            actionText = null,
+            onAction = {},
         )
         PermissionSetupStep(
-            title = "2. 授予运行命令权限",
-            completed = environment.permissionGranted,
+            title = "2. 授予 Alpha Root 权限",
+            completed = environment.rootGranted,
             onAlphaPermission = onRequestAlphaSetup,
             alphaSetupInProgress = alphaSetupInProgress,
         )
         SetupStep(
-            title = "3. 连接 Termux",
-            completed = environment.connectionAvailable,
+            title = "3. 安装 Chroot 后端",
+            completed = environment.backendReady,
             description = when {
-                environment.connectionAvailable ->
-                    "Termux 已允许 Ubuntu 管理器通过 RUN_COMMAND 执行预定义操作"
-                environment.termuxStopped ->
-                    "Termux 已被系统完全停止。打开 Termux 后返回本应用，会自动重新连接。"
-                environment.externalAppsConfigured ->
-                    "外部调用配置已经完成，但 Termux 当前没有响应。请打开 Termux 后返回。"
+                environment.backendReady ->
+                    "私有挂载命名空间、实例镜像和监督脚本已经就绪"
                 else ->
-                    "可通过 Magisk Alpha 自动写入并重新加载设置，或在 Termux 的 " +
-                        "~/.termux/termux.properties 中手动加入：\nallow-external-apps=true"
+                    "点击配置后会安装固定监督脚本，不会改动现有 Termux/PRoot 数据"
             },
             actionText = when {
-                environment.connectionAvailable ||
-                    environment.termuxStopped ||
-                    environment.externalAppsConfigured -> null
+                environment.backendReady -> null
                 alphaSetupInProgress -> "正在配置…"
                 else -> "Magisk Alpha 配置"
             },
-            secondaryActionText = if (environment.connectionAvailable) null else "打开 Termux",
+            secondaryActionText = null,
             actionEnabled = !alphaSetupInProgress,
             onAction = onRequestAlphaSetup,
-            onSecondaryAction = onOpenTermux,
-        )
-        SetupStep(
-            title = "4. 检查 PRoot Distro",
-            completed = environment.prootCompatible,
-            description = environment.prootVersion?.let { "当前版本 $it，需要 5.1 或更高版本" }
-                ?: "请在 Termux 执行 pkg upgrade && pkg install proot-distro",
-            actionText = if (environment.prootCompatible) null else "打开 Termux",
-            onAction = onOpenTermux,
+            onSecondaryAction = {},
         )
         environment.error?.let {
             Text(
@@ -466,9 +512,9 @@ private fun PermissionSetupStep(
             Spacer(Modifier.height(8.dp))
             Text(
                 if (completed) {
-                    "已授予“在 Termux 环境中运行命令”权限"
+                    "Ubuntu 管理器已获得 Magisk Alpha 超级用户权限"
                 } else {
-                    "使用 Magisk Alpha 完成固定权限配置，不提供自动降级或其他授权入口。"
+                    "权限只用于固定的镜像、挂载、Chroot 和进程管理操作。"
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -559,14 +605,13 @@ fun CreateInstanceScreen(
         .first { it !in usedPorts }
     var name by remember { mutableStateOf("") }
     var portText by remember { mutableStateOf(suggestedPort.toString()) }
-    var initializeSsh by remember { mutableStateOf(true) }
     var startAfterCreate by remember { mutableStateOf(false) }
     var protectAfterCreate by remember { mutableStateOf(true) }
 
     val port = portText.toIntOrNull()
     val nameError = when {
         name.isBlank() -> null
-        !ProotDistroClient.isValidName(name) -> "名称格式不正确"
+        !ChrootClient.isValidName(name) -> "名称格式不正确"
         state.instances.any { it.name == name } -> "实例名称已经存在"
         else -> null
     }
@@ -618,19 +663,13 @@ fun CreateInstanceScreen(
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth(),
         )
-        CheckRow(
-            checked = initializeSsh,
-            onCheckedChange = {
-                initializeSsh = it
-                if (!it) startAfterCreate = false
-            },
-            title = "安装并初始化 SSH",
-            description = "创建后执行 apt 更新并安装 openssh-server",
+        Text(
+            "基础组件：OpenSSH、tmux、ttyd、Nmap、iproute2（自动安装）",
+            style = MaterialTheme.typography.bodyMedium,
         )
         CheckRow(
             checked = startAfterCreate,
             onCheckedChange = { startAfterCreate = it },
-            enabled = initializeSsh,
             title = "创建后立即启动",
             description = "在后台启动 SSH 服务",
         )
@@ -656,7 +695,7 @@ fun CreateInstanceScreen(
                 onCreate(
                     name,
                     port!!,
-                    initializeSsh,
+                    true,
                     startAfterCreate,
                     protectAfterCreate,
                 )
@@ -704,17 +743,21 @@ fun InstanceDetailScreen(
     allInstances: List<UbuntuInstance>,
     lastStatusCheckEpochMillis: Long?,
     operationInProgress: Boolean,
+    autoStartAvailable: Boolean,
+    autoStartGloballyEnabled: Boolean,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onRestart: () -> Unit,
     onForceStop: () -> Unit,
     onInitializeSsh: () -> Unit,
     onLocalSession: () -> Unit,
-    onBackup: () -> Unit,
+    onBackup: (String) -> Unit,
     onLogs: () -> Unit,
-    onOpenTermux: () -> Unit,
     onProtectionChanged: (Boolean) -> Unit,
+    onAutoStartChanged: (Boolean) -> Unit,
     onUpdatePort: (Int) -> Unit,
+    onUpdateRootPassword: (String) -> Unit,
+    onClearSavedRootPassword: () -> Unit,
     onRename: (String) -> Unit,
     onClone: (String, Int, Boolean) -> Unit,
     onDelete: () -> Unit,
@@ -728,8 +771,10 @@ fun InstanceDetailScreen(
     var confirmDelete by remember { mutableStateOf(false) }
     var confirmUnlock by remember { mutableStateOf(false) }
     var showPortEditor by remember { mutableStateOf(false) }
+    var showPasswordEditor by remember { mutableStateOf(false) }
     var showRename by remember { mutableStateOf(false) }
     var showClone by remember { mutableStateOf(false) }
+    var showBackupName by remember { mutableStateOf(false) }
     var showAdvanced by remember { mutableStateOf(false) }
     val running = instance.state == InstanceRuntimeState.RUNNING ||
         instance.state == InstanceRuntimeState.SSH_READY
@@ -749,6 +794,7 @@ fun InstanceDetailScreen(
                 "${instance.hostAddress ?: "127.0.0.1"}:${instance.sshPort}",
             )
             InfoRow("SSH 端口", instance.sshPort.toString())
+            InfoRow("SSH 账户", "root")
             InfoRow("运行时间", instance.uptime ?: "—")
             InfoRow("实例保护", if (instance.isProtected) "已保护" else "未保护")
             InfoRow("实例来源", if (instance.isManaged) "本应用创建" else "外部已有实例")
@@ -808,7 +854,7 @@ fun InstanceDetailScreen(
 
         SectionCard("数据管理") {
             Button(
-                onClick = onBackup,
+                onClick = { showBackupName = true },
                 enabled = !operationInProgress &&
                     instance.state == InstanceRuntimeState.STOPPED,
                 modifier = Modifier.fillMaxWidth(),
@@ -862,6 +908,26 @@ fun InstanceDetailScreen(
                     HorizontalDivider()
                     Text("实例设置", fontWeight = FontWeight.SemiBold)
                     InfoRow("实例名称", instance.name)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("此实例开机自动启动", fontWeight = FontWeight.Medium)
+                            Text(
+                                when {
+                                    !autoStartAvailable -> "需要先安装或更新 Root Chroot 后端"
+                                    instance.autoStartEnabled && !autoStartGloballyEnabled ->
+                                        "实例已勾选，但设置页总开关当前关闭"
+                                    else -> "由 Magisk Alpha 在开机后直接启动，不依赖管理器进程"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = instance.autoStartEnabled,
+                            onCheckedChange = onAutoStartChanged,
+                            enabled = autoStartAvailable && !operationInProgress,
+                        )
+                    }
                     OutlinedButton(
                         onClick = { showPortEditor = true },
                         enabled = !operationInProgress &&
@@ -870,6 +936,20 @@ fun InstanceDetailScreen(
                     ) {
                         Text("修改 SSH 端口")
                     }
+                    OutlinedButton(
+                        onClick = { showPasswordEditor = true },
+                        enabled = !operationInProgress &&
+                            instance.state != InstanceRuntimeState.UNKNOWN,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("修改 root 密码")
+                    }
+                    Text(
+                        "新建或修复 SSH 时，未设置密码的 root 默认使用 " +
+                            ChrootClient.DEFAULT_ROOT_PASSWORD,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     OutlinedButton(
                         onClick = { showRename = true },
                         enabled = !operationInProgress && stopped && !instance.isProtected,
@@ -906,19 +986,11 @@ fun InstanceDetailScreen(
                     ) {
                         Text("重启 SSH")
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = onOpenTermux,
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Text("Termux")
-                        }
-                        OutlinedButton(
-                            onClick = onLogs,
-                            modifier = Modifier.weight(1f),
-                        ) {
-                            Text("查看日志")
-                        }
+                    OutlinedButton(
+                        onClick = onLogs,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("查看 Chroot / SSH 日志")
                     }
                     OutlinedButton(
                         onClick = { confirmForceStop = true },
@@ -1009,6 +1081,22 @@ fun InstanceDetailScreen(
             },
         )
     }
+    if (showPasswordEditor) {
+        EditRootPasswordDialog(
+            instanceName = instance.name,
+            savedPassword = instance.savedRootPassword,
+            savedAtEpochMillis = instance.savedRootPasswordUpdatedAt,
+            onDismiss = { showPasswordEditor = false },
+            onClearSavedPassword = {
+                showPasswordEditor = false
+                onClearSavedRootPassword()
+            },
+            onConfirm = {
+                showPasswordEditor = false
+                onUpdateRootPassword(it)
+            },
+        )
+    }
     if (showRename) {
         RenameInstanceDialog(
             instanceName = instance.name,
@@ -1031,6 +1119,69 @@ fun InstanceDetailScreen(
             },
         )
     }
+    if (showBackupName) {
+        BackupNameDialog(
+            instanceName = instance.name,
+            onDismiss = { showBackupName = false },
+            onConfirm = { displayName ->
+                showBackupName = false
+                onBackup(displayName)
+            },
+        )
+    }
+}
+
+@Composable
+private fun BackupNameDialog(
+    instanceName: String,
+    initialName: String = "$instanceName 备份",
+    title: String = "创建实例备份",
+    confirmText: String = "开始备份",
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var displayName by remember(instanceName, initialName) { mutableStateOf(initialName) }
+    val normalized = displayName.trim()
+    val error = when {
+        normalized.isEmpty() -> "请输入备份名称"
+        normalized.length > ChrootClient.MAX_BACKUP_DISPLAY_NAME_LENGTH ->
+            "名称不能超过 ${ChrootClient.MAX_BACKUP_DISPLAY_NAME_LENGTH} 个字符"
+        displayName.any { it == '\n' || it == '\r' || it == '\u0000' } ->
+            "名称不能包含换行或空字符"
+        else -> null
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                InfoRow("实例", instanceName)
+                OutlinedTextField(
+                    value = displayName,
+                    onValueChange = {
+                        if (it.length <= ChrootClient.MAX_BACKUP_DISPLAY_NAME_LENGTH) {
+                            displayName = it
+                        }
+                    },
+                    label = { Text("备份名称") },
+                    supportingText = { Text(error ?: "名称可随时修改，不影响镜像文件") },
+                    isError = error != null,
+                    singleLine = true,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(normalized) },
+                enabled = error == null,
+            ) {
+                Text(confirmText)
+            }
+        },
+    )
 }
 
 @Composable
@@ -1204,8 +1355,9 @@ private fun EditPortDialog(
                 )
                 if (running) {
                     Text(
-                        "实例正在运行。应用后会停止全部会话并使用新端口重新启动 SSH；失败时会恢复原端口。",
-                        color = MaterialTheme.colorScheme.error,
+                        "实例正在运行。应用后只会重启 SSH，其他 Ubuntu 会话保持运行；" +
+                            "失败时会恢复原端口。",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
@@ -1225,6 +1377,87 @@ private fun EditPortDialog(
 }
 
 @Composable
+private fun EditRootPasswordDialog(
+    instanceName: String,
+    savedPassword: String?,
+    savedAtEpochMillis: Long?,
+    onDismiss: () -> Unit,
+    onClearSavedPassword: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var password by remember(instanceName, savedPassword) {
+        mutableStateOf(savedPassword ?: ChrootClient.DEFAULT_ROOT_PASSWORD)
+    }
+    val error = ChrootClient.rootPasswordValidationError(password)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("修改 root 密码") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                InfoRow("实例", instanceName)
+                InfoRow("账户", "root")
+                InfoRow(
+                    "本地记录",
+                    if (savedPassword == null) "尚未保存" else "管理器已加密保存",
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { if (it.length <= 128) password = it },
+                    label = {
+                        Text(
+                            if (savedPassword == null) {
+                                "要设置的新密码（明文）"
+                            } else {
+                                "管理器保存的密码（明文）"
+                            },
+                        )
+                    },
+                    supportingText = {
+                        Text(
+                            error ?: if (savedPassword == null) {
+                                "当前显示默认建议值；保存成功后才会建立加密记录"
+                            } else {
+                                "这是管理器上次成功设置的值；在 Ubuntu 内修改后可能不一致"
+                            },
+                        )
+                    },
+                    isError = error != null,
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                )
+                if (savedPassword != null) {
+                    savedAtEpochMillis?.takeIf { it > 0L }?.let { savedAt ->
+                        Text(
+                            "记录时间：${formatDateMillis(savedAt)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(
+                        onClick = onClearSavedPassword,
+                        modifier = Modifier.align(Alignment.End),
+                    ) {
+                        Text("清除管理器记录")
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(password) },
+                enabled = error == null,
+            ) {
+                Text("保存")
+            }
+        },
+    )
+}
+
+@Composable
 private fun RenameInstanceDialog(
     instanceName: String,
     existingNames: Set<String>,
@@ -1234,7 +1467,7 @@ private fun RenameInstanceDialog(
     var newName by remember(instanceName) { mutableStateOf(instanceName) }
     val error = when {
         newName == instanceName -> "请输入新的实例名称"
-        !ProotDistroClient.isValidName(newName) -> "名称格式不正确"
+        !ChrootClient.isValidName(newName) -> "名称格式不正确"
         newName in existingNames -> "实例名称已经存在"
         else -> null
     }
@@ -1243,7 +1476,7 @@ private fun RenameInstanceDialog(
         title = { Text("重命名 $instanceName") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("重命名会更新 PRoot 的软链接记录，实例越大耗时越长。过程中不要关闭应用。")
+                Text("重命名会更新独立 ext4 镜像和管理记录，过程中不要关闭应用。")
                 OutlinedTextField(
                     value = newName,
                     onValueChange = { if (it.length <= 32) newName = it },
@@ -1290,7 +1523,7 @@ private fun CloneInstanceDialog(
     var protectTarget by remember(sourceName) { mutableStateOf(true) }
     val port = portText.toIntOrNull()
     val nameError = when {
-        !ProotDistroClient.isValidName(targetName) -> "名称格式不正确"
+        !ChrootClient.isValidName(targetName) -> "名称格式不正确"
         targetName in existingNames -> "实例名称已经存在"
         else -> null
     }
@@ -1355,11 +1588,13 @@ fun BackupsScreen(
     state: AppUiState,
     onRestore: (BackupEntry) -> Unit,
     onDelete: (BackupEntry) -> Unit,
+    onRename: (BackupEntry, String) -> Unit,
     onOpenStorageSettings: () -> Unit,
     onRefresh: () -> Unit,
 ) {
     var restoreCandidate by remember { mutableStateOf<BackupEntry?>(null) }
     var deleteCandidate by remember { mutableStateOf<BackupEntry?>(null) }
+    var renameCandidate by remember { mutableStateOf<BackupEntry?>(null) }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
@@ -1368,7 +1603,28 @@ fun BackupsScreen(
         state.currentOperation?.let {
             item { OperationCard(it.label) }
         }
-        if (!state.environment.storageReady) {
+        if (state.backupsSyncing) {
+            item {
+                OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text("正在同步真实备份目录")
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                }
+            }
+        } else if (state.backups.isNotEmpty() && !state.backupsVerified) {
+            item {
+                Text(
+                    "当前显示本地缓存，尚未与 Root 备份目录核对。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (!state.environment.backupReady) {
             item {
                 Card(
                     colors = CardDefaults.cardColors(
@@ -1394,7 +1650,28 @@ fun BackupsScreen(
                 }
             }
         }
-        if (state.backups.isEmpty()) {
+        if (state.backups.isNotEmpty()) {
+            item {
+                OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text("实例备份", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "${state.backups.size} 份 · 共 ${formatBytes(state.backups.sumOf { it.sizeBytes })}",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "每份备份只包含一个 Ubuntu 实例的 ext4 镜像，不包含管理器或外部存储。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        if (state.backups.isEmpty() && !state.backupsSyncing) {
             item {
                 OutlinedCard(modifier = Modifier.fillMaxWidth()) {
                     Column(
@@ -1420,6 +1697,7 @@ fun BackupsScreen(
                     protectedTarget = target?.isProtected == true,
                     enabled = state.currentOperation == null,
                     onRestore = { restoreCandidate = backup },
+                    onRename = { renameCandidate = backup },
                     onDelete = { deleteCandidate = backup },
                 )
             }
@@ -1441,15 +1719,28 @@ fun BackupsScreen(
     }
     deleteCandidate?.let { backup ->
         ConfirmDialog(
-            title = "删除 ${backup.instanceName} 的备份？",
+            title = "删除 ${backup.displayName}？",
             message = "${backup.fileName}\n${formatBytes(backup.sizeBytes)}\n\n" +
-                "备份压缩包和 SHA-256 校验文件都会被永久删除，此操作无法恢复。",
+                "备份镜像、SHA-256 和名称元数据都会被永久删除，此操作无法恢复。",
             confirmText = "永久删除",
             dangerous = true,
             onDismiss = { deleteCandidate = null },
             onConfirm = {
                 deleteCandidate = null
                 onDelete(backup)
+            },
+        )
+    }
+    renameCandidate?.let { backup ->
+        BackupNameDialog(
+            instanceName = backup.instanceName,
+            initialName = backup.displayName,
+            title = "修改备份名称",
+            confirmText = "保存名称",
+            onDismiss = { renameCandidate = null },
+            onConfirm = { displayName ->
+                renameCandidate = null
+                onRename(backup, displayName)
             },
         )
     }
@@ -1461,6 +1752,7 @@ private fun BackupCard(
     protectedTarget: Boolean,
     enabled: Boolean,
     onRestore: () -> Unit,
+    onRename: () -> Unit,
     onDelete: () -> Unit,
 ) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
@@ -1472,11 +1764,16 @@ private fun BackupCard(
                 Icon(Icons.Default.Share, contentDescription = null)
                 Spacer(Modifier.width(10.dp))
                 Text(
-                    backup.instanceName,
+                    backup.displayName,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
+                TextButton(onClick = onRename, enabled = enabled) {
+                    Text("改名")
+                }
                 if (backup.checksumPresent) {
                     Icon(
                         Icons.Default.CheckCircle,
@@ -1486,11 +1783,21 @@ private fun BackupCard(
                 }
             }
             Text(
+                "实例：${backup.instanceName}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
                 formatDate(backup.modifiedEpochSeconds),
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
-                "${formatBytes(backup.sizeBytes)} · ${
+                "实际占用 ${formatBytes(backup.sizeBytes)}" +
+                    if (backup.logicalSizeBytes > 0) {
+                        " · 容量 ${formatBytes(backup.logicalSizeBytes)}"
+                    } else {
+                        ""
+                    } + " · ${
                     if (backup.checksumPresent) "包含 SHA-256 校验" else "没有校验文件"
                 }",
                 style = MaterialTheme.typography.bodySmall,
@@ -1545,6 +1852,7 @@ fun CommandLibraryScreen(
     state: AppUiState,
     initialInstanceName: String?,
     onRunCommand: (String, String) -> Unit,
+    onSendKeyAction: (String, String) -> Unit,
     onSaveTags: (List<CommandTag>) -> Unit,
     onSaveCommand: (UserCommand) -> Unit,
     onDeleteCommand: (String) -> Unit,
@@ -1646,13 +1954,25 @@ fun CommandLibraryScreen(
                             Text(command.title, fontWeight = FontWeight.SemiBold)
                         },
                         supportingContent = {
-                            Text(
-                                command.script.replace('\n', ' '),
-                                maxLines = 1,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                                fontFamily = FontFamily.Monospace,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+                            Column {
+                                Text(
+                                    if (command.type == UserCommandType.KEY) {
+                                        "按键"
+                                    } else {
+                                        "命令"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                                Text(
+                                    command.actionSummary(),
+                                    maxLines = 1,
+                                    overflow =
+                                        androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    fontFamily = FontFamily.Monospace,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                         },
                         leadingContent = {
                             Icon(Icons.Default.Build, contentDescription = null)
@@ -1692,7 +2012,7 @@ fun CommandLibraryScreen(
             },
             text = {
                 Text(
-                    command.script,
+                    command.actionSummary(),
                     maxLines = 6,
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                     fontFamily = FontFamily.Monospace,
@@ -1710,7 +2030,13 @@ fun CommandLibraryScreen(
                     },
                     enabled = state.instances.isNotEmpty() && state.currentOperation == null,
                 ) {
-                    Text("选择实例执行")
+                    Text(
+                        if (command.type == UserCommandType.KEY) {
+                            "选择实例并发送"
+                        } else {
+                            "选择实例执行"
+                        },
+                    )
                 }
             },
             dismissButton = {
@@ -1759,11 +2085,15 @@ fun CommandLibraryScreen(
                     onClick = {
                         val target = targetInstanceName ?: return@TextButton
                         runCandidate = null
-                        onRunCommand(target, command.id)
+                        if (command.type == UserCommandType.KEY) {
+                            onSendKeyAction(target, command.id)
+                        } else {
+                            onRunCommand(target, command.id)
+                        }
                     },
                     enabled = targetInstanceName != null && state.currentOperation == null,
                 ) {
-                    Text("执行")
+                    Text(if (command.type == UserCommandType.KEY) "进入会话并发送" else "执行")
                 }
             },
             dismissButton = {
@@ -1859,7 +2189,19 @@ private fun CommandEditor(
 ) {
     var title by remember(command.id) { mutableStateOf(command.title) }
     var script by remember(command.id) { mutableStateOf(command.script) }
+    var type by remember(command.id) { mutableStateOf(command.type) }
+    var keyStroke by remember(command.id) {
+        mutableStateOf(command.keyStroke ?: TerminalKeyStroke(key = "c", ctrl = true))
+    }
+    var selectedKeyGroup by remember(command.id) {
+        mutableStateOf(
+            TerminalKeys.option(command.keyStroke?.key.orEmpty())?.group ?: "字母",
+        )
+    }
     var tagIds by remember(command.id) { mutableStateOf(command.tagIds) }
+    var confirmBeforeRun by remember(command.id) {
+        mutableStateOf(command.confirmBeforeRun)
+    }
     var confirmDelete by remember(command.id) { mutableStateOf(false) }
 
     Column(
@@ -1884,14 +2226,78 @@ private fun CommandEditor(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-        OutlinedTextField(
-            value = script,
-            onValueChange = { script = it.take(32_768) },
-            label = { Text("命令") },
-            minLines = 8,
-            modifier = Modifier.fillMaxWidth(),
-            textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace),
-        )
+        Text("动作类型", fontWeight = FontWeight.SemiBold)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = type == UserCommandType.COMMAND,
+                onClick = { type = UserCommandType.COMMAND },
+                label = { Text("命令") },
+            )
+            FilterChip(
+                selected = type == UserCommandType.KEY,
+                onClick = { type = UserCommandType.KEY },
+                label = { Text("按键") },
+            )
+        }
+        if (type == UserCommandType.COMMAND) {
+            OutlinedTextField(
+                value = script,
+                onValueChange = { script = it.take(32_768) },
+                label = { Text("命令") },
+                minLines = 8,
+                modifier = Modifier.fillMaxWidth(),
+                textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace),
+            )
+        } else {
+            Text("组合键", fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = keyStroke.ctrl,
+                    onClick = { keyStroke = keyStroke.copy(ctrl = !keyStroke.ctrl) },
+                    label = { Text("Ctrl") },
+                )
+                FilterChip(
+                    selected = keyStroke.alt,
+                    onClick = { keyStroke = keyStroke.copy(alt = !keyStroke.alt) },
+                    label = { Text("Alt") },
+                )
+                FilterChip(
+                    selected = keyStroke.shift,
+                    onClick = { keyStroke = keyStroke.copy(shift = !keyStroke.shift) },
+                    label = { Text("Shift") },
+                )
+            }
+            Text("按键类别", fontWeight = FontWeight.SemiBold)
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(TerminalKeys.options.map { it.group }.distinct()) { group ->
+                    FilterChip(
+                        selected = selectedKeyGroup == group,
+                        onClick = { selectedKeyGroup = group },
+                        label = { Text(group) },
+                    )
+                }
+            }
+            Text("主按键", fontWeight = FontWeight.SemiBold)
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(TerminalKeys.options.filter { it.group == selectedKeyGroup }) { option ->
+                    FilterChip(
+                        selected = keyStroke.key == option.id,
+                        onClick = { keyStroke = keyStroke.copy(key = option.id) },
+                        label = { Text(option.label) },
+                    )
+                }
+            }
+            OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(14.dp)) {
+                    Text("按键预览", style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        TerminalKeys.displayName(keyStroke),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        }
         if (availableTags.isNotEmpty()) {
             Text("所属标签", fontWeight = FontWeight.SemiBold)
             availableTags.forEach { tag ->
@@ -1913,17 +2319,44 @@ private fun CommandEditor(
                 }
             }
         }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { confirmBeforeRun = !confirmBeforeRun }
+                .padding(vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(
+                checked = confirmBeforeRun,
+                onCheckedChange = { confirmBeforeRun = it },
+            )
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text("执行前确认", fontWeight = FontWeight.Medium)
+                Text(
+                    "在会话快捷指令中点击时，先显示精简确认窗口",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
         Button(
             onClick = {
                 onSave(
                     command.copy(
                         title = title.trim(),
-                        script = script.trim(),
+                        script = if (type == UserCommandType.COMMAND) script.trim() else "",
                         tagIds = tagIds,
+                        type = type,
+                        keyStroke = if (type == UserCommandType.KEY) keyStroke else null,
+                        confirmBeforeRun = confirmBeforeRun,
                     ),
                 )
             },
-            enabled = title.isNotBlank() && script.isNotBlank(),
+            enabled = title.isNotBlank() && when (type) {
+                UserCommandType.COMMAND -> script.isNotBlank()
+                UserCommandType.KEY -> TerminalKeys.isValid(keyStroke)
+            },
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("保存")
@@ -1958,27 +2391,20 @@ fun SettingsScreen(
     state: AppUiState,
     dynamicColors: Boolean,
     onDynamicColorsChanged: (Boolean) -> Unit,
-    onHideMaintenanceFromRecentsChanged: (Boolean) -> Unit,
-    onTermuxBackgroundProtectionChanged: (Boolean) -> Unit,
-    onTermuxWakeLockAlwaysOnChanged: (Boolean) -> Unit,
+    onHideFromRecentsWhenBackgroundChanged: (Boolean) -> Unit,
+    onAutoStartEnabledChanged: (Boolean) -> Unit,
+    onBackupRetentionCountChanged: (Int) -> Unit,
     onRequestBackgroundAlphaSetup: () -> Unit,
     backgroundSetupInProgress: Boolean,
-    onOpenTermux: () -> Unit,
     onRequestAlphaSetup: () -> Unit,
     alphaSetupInProgress: Boolean,
     onRequestNotifications: () -> Unit,
-    onRequestStorageAlphaRepair: () -> Unit,
-    storageRepairInProgress: Boolean,
-    onRequestStorageAlphaLinks: (Boolean) -> Unit,
-    storageLinkInProgress: Boolean,
     onSaveTerminalShortcuts: (List<TerminalShortcutPreference>) -> Unit,
     onRefresh: () -> Unit,
 ) {
     val context = LocalContext.current
-    val storagePermissionsReady = state.environment.termuxReadStorageGranted &&
-        state.environment.termuxWriteStorageGranted &&
-        state.environment.termuxAllFilesGranted
     var showShortcutSettings by remember { mutableStateOf(false) }
+    var pendingBackupRetention by remember { mutableStateOf<Int?>(null) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -2005,69 +2431,43 @@ fun SettingsScreen(
         SectionCard("后台运行保护") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("维护任务期间隐藏最近任务卡片", fontWeight = FontWeight.Medium)
+                    Text("退到后台时隐藏最近任务卡片", fontWeight = FontWeight.Medium)
                     Text(
-                        "仅防止误划；后台任务仍通过低干扰通知进入",
+                        "重新点击桌面图标即可返回；不会停止实例或维护任务",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Switch(
-                    checked = state.hideMaintenanceFromRecents,
-                    onCheckedChange = onHideMaintenanceFromRecentsChanged,
+                    checked = state.hideFromRecentsWhenBackground,
+                    onCheckedChange = onHideFromRecentsWhenBackgroundChanged,
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Termux 后台保护", fontWeight = FontWeight.Medium)
+                    Text("开机自动启动实例", fontWeight = FontWeight.Medium)
                     Text(
-                        "实例、本地会话或后台维护任务运行时自动持有 WakeLock",
+                        if (state.environment.autoStartReady) {
+                            "Alpha service.d 将启动每个已勾选实例，不会打开管理器或触发 Root 弹窗"
+                        } else {
+                            "需要先在运行环境中安装或更新 Root Chroot 后端"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Switch(
-                    checked = state.termuxBackgroundProtection,
-                    onCheckedChange = onTermuxBackgroundProtectionChanged,
+                    checked = state.autoStartEnabled,
+                    onCheckedChange = onAutoStartEnabledChanged,
+                    enabled = state.environment.autoStartReady && state.currentOperation == null,
                 )
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("持续保持 WakeLock", fontWeight = FontWeight.Medium)
-                    Text(
-                        "即使没有运行实例也保持，适合长期后台任务，但会增加耗电",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                Switch(
-                    checked = state.termuxWakeLockAlwaysOn,
-                    onCheckedChange = onTermuxWakeLockAlwaysOnChanged,
-                    enabled = state.termuxBackgroundProtection,
-                )
-            }
-            InfoRow(
-                "Termux WakeLock",
-                when (state.termuxWakeLockState) {
-                    TermuxWakeLockState.DISABLED -> "已关闭"
-                    TermuxWakeLockState.IDLE -> "待机"
-                    TermuxWakeLockState.ACQUIRING -> "正在启用"
-                    TermuxWakeLockState.HELD -> "已持有"
-                    TermuxWakeLockState.RELEASING -> "正在释放"
-                    TermuxWakeLockState.ERROR -> "异常"
-                },
+            InfoRow("实例后台", "Alpha Root 独立监督进程")
+            Text(
+                "实例不依赖 Termux 进程；系统仍可能限制管理器的后台维护任务，建议保留通知并加入白名单。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            state.termuxWakeLockMessage?.let { message ->
-                Text(
-                    message,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (state.termuxWakeLockState == TermuxWakeLockState.ERROR) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
-            }
             state.backgroundOperation?.let { operation ->
                 val status = when (operation.status) {
                     BackgroundOperationStatus.RUNNING -> "运行中"
@@ -2092,8 +2492,7 @@ fun SettingsScreen(
                 }
             }
             Text(
-                "系统要求可靠后台任务保持可见通知。管理器不会使用 Root 隐藏进程或" +
-                    "Termux 通知，也不会在中断后自动重复执行破坏性操作。",
+                "系统要求可靠后台维护任务保持可见通知；任务中断后不会自动重复破坏性操作。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -2124,19 +2523,11 @@ fun SettingsScreen(
             ) {
                 Text("打开 MIUI 自启动管理")
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(
-                    onClick = { openAppDetails(context, context.packageName) },
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text("管理器应用设置")
-                }
-                TextButton(
-                    onClick = { openAppDetails(context, "com.termux") },
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text("Termux 应用设置")
-                }
+            TextButton(
+                onClick = { openAppDetails(context, context.packageName) },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("管理器应用设置")
             }
         }
         SectionCard("终端快捷键") {
@@ -2154,22 +2545,21 @@ fun SettingsScreen(
         }
         SectionCard("运行环境") {
             InfoRow(
-                "Termux",
-                if (state.environment.termuxInstalled) {
-                    state.environment.termuxVersion ?: "已安装"
+                "Magisk Alpha",
+                if (state.environment.alphaInstalled) {
+                    state.environment.alphaVersion ?: "已安装"
                 } else {
                     "未安装"
                 },
             )
-            InfoRow("RUN_COMMAND 权限", if (state.environment.permissionGranted) "已授予" else "未授予")
-            InfoRow("外部调用", if (state.environment.connectionAvailable) "可用" else "不可用")
-            InfoRow("PRoot Distro", state.environment.prootVersion ?: "未检测到")
-            InfoRow("备份目录", if (state.environment.storageReady) "可用" else "未授权")
-            OutlinedButton(onClick = onOpenTermux, modifier = Modifier.fillMaxWidth()) {
-                Icon(Icons.Default.Build, contentDescription = null)
-                Spacer(Modifier.width(8.dp))
-                Text("打开 Termux")
-            }
+            InfoRow("Root 权限", if (state.environment.rootGranted) "已授权" else "未授权")
+            InfoRow("Chroot 后端", state.environment.backendVersion ?: "未安装")
+            InfoRow(
+                "开机启动脚本",
+                if (state.environment.autoStartReady) "Alpha service.d 已安装" else "未安装",
+            )
+            InfoRow("实例模式", "独立 ext4 镜像 · 共享宿主网络")
+            InfoRow("备份目录", if (state.environment.backupReady) "Root 私有目录可用" else "不可用")
             OutlinedButton(
                 onClick = onRequestAlphaSetup,
                 enabled = !alphaSetupInProgress,
@@ -2181,7 +2571,7 @@ fun SettingsScreen(
                     if (alphaSetupInProgress) {
                         "等待 Magisk Alpha…"
                     } else {
-                        "Magisk Alpha 首次配置"
+                        "安装/更新 Root Chroot 后端"
                     },
                 )
             }
@@ -2190,101 +2580,44 @@ fun SettingsScreen(
             }
         }
         SectionCard("备份与存储") {
-            InfoRow(
-                "Termux 读取权限",
-                if (state.environment.termuxReadStorageGranted) "已授予" else "未授予",
-            )
-            InfoRow(
-                "Termux 写入权限",
-                if (state.environment.termuxWriteStorageGranted) "已授予" else "未授予",
-            )
-            InfoRow(
-                "所有文件访问",
-                if (state.environment.termuxAllFilesGranted) "已允许" else "未允许",
-            )
-            InfoRow(
-                "~/storage 目录链接",
-                if (state.environment.storageLinksPresent) "已创建" else "未创建",
-            )
-            InfoRow(
-                "Download 写入测试",
-                if (state.environment.storageWriteTestPassed) "通过" else "未通过",
-            )
+            Text("每个实例自动保留", fontWeight = FontWeight.Medium)
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(listOf(0, 2, 3, 5, 10)) { count ->
+                    FilterChip(
+                        selected = state.backupRetentionCount == count,
+                        onClick = {
+                            if (count == 0) {
+                                onBackupRetentionCountChanged(0)
+                            } else {
+                                pendingBackupRetention = count
+                            }
+                        },
+                        label = { Text(if (count == 0) "关闭" else "$count 份") },
+                    )
+                }
+            }
             Text(
-                "备份保存在 Download/UbuntuManager。系统权限和目录链接是两个独立步骤；" +
-                    "所有存储处理只通过固定的 Magisk Alpha 操作完成，不自动切换其他入口。",
+                if (state.backupRetentionCount == 0) {
+                    "不会自动删除旧备份，可在备份页面手动确认删除。"
+                } else {
+                    "新备份成功发布后，只保留该实例最近 ${state.backupRetentionCount} 份；" +
+                        "超出的旧备份会自动删除。"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (!storagePermissionsReady) {
-                Button(
-                    onClick = onRequestStorageAlphaRepair,
-                    enabled = !storageRepairInProgress &&
-                        !storageLinkInProgress &&
-                        state.currentOperation == null,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Default.Lock, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        if (storageRepairInProgress) {
-                            "等待 Magisk Alpha…"
-                        } else {
-                            "Magisk Alpha：修复存储权限"
-                        },
-                    )
-                }
-            }
-            if (
-                storagePermissionsReady &&
-                !state.environment.storageDirectoryPresent
-            ) {
-                Button(
-                    onClick = { onRequestStorageAlphaLinks(false) },
-                    enabled = !storageRepairInProgress &&
-                        !storageLinkInProgress &&
-                        state.currentOperation == null,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Default.Lock, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        if (storageLinkInProgress) {
-                            "正在等待 Termux 创建链接…"
-                        } else {
-                            "Magisk Alpha：创建目录链接"
-                        },
-                    )
-                }
-            }
-            if (
-                storagePermissionsReady &&
-                state.environment.storageDirectoryPresent &&
-                (
-                    !state.environment.storageLinksPresent ||
-                        !state.environment.storageWriteTestPassed
-                    )
-            ) {
-                OutlinedButton(
-                    onClick = { onRequestStorageAlphaLinks(true) },
-                    enabled = !storageRepairInProgress &&
-                        !storageLinkInProgress &&
-                        state.currentOperation == null,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Default.Warning, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        if (storageLinkInProgress) {
-                            "正在等待 Termux 重建链接…"
-                        } else {
-                            "Magisk Alpha：安全重建目录链接"
-                        },
-                    )
-                }
-            }
+            InfoRow("备份格式", "稀疏 ext4 镜像 + SHA-256")
+            InfoRow("备份位置", "/data/local/cntermux/backups")
+            Text(
+                "备份由 Alpha Root 直接复制停止状态下的实例镜像，不需要 Termux 存储授权或目录链接。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             TextButton(onClick = onRefresh, modifier = Modifier.fillMaxWidth()) {
-                Text("重新检查全部存储状态")
+                Text("重新检查 Chroot 与备份目录")
             }
         }
         Text(
@@ -2304,6 +2637,21 @@ fun SettingsScreen(
             onSave = {
                 showShortcutSettings = false
                 onSaveTerminalShortcuts(it)
+            },
+        )
+    }
+
+    pendingBackupRetention?.let { count ->
+        ConfirmDialog(
+            title = "启用自动清理旧备份？",
+            message = "设置后，每次新备份成功发布时，每个实例只保留最近 $count 份。" +
+                "更早的备份及其 SHA-256 文件会自动删除，不再逐份确认。",
+            confirmText = "保留最近 $count 份",
+            dangerous = true,
+            onDismiss = { pendingBackupRetention = null },
+            onConfirm = {
+                pendingBackupRetention = null
+                onBackupRetentionCountChanged(count)
             },
         )
     }
@@ -2346,6 +2694,9 @@ private fun TerminalShortcutSettingsDialog(
     var editable by remember(current) { mutableStateOf(current) }
     var draft by remember { mutableStateOf<TerminalShortcutPreference?>(null) }
     val editing = draft
+    val boundLibraryCommand = editing?.takeIf {
+        it.action == TerminalShortcutAction.COMMAND
+    }?.let { shortcut -> commands.firstOrNull { it.id == shortcut.payload } }
     val draftValid = editing?.let { shortcut ->
         shortcut.label.isNotBlank() && when (shortcut.action) {
             TerminalShortcutAction.BUILTIN ->
@@ -2525,20 +2876,38 @@ private fun TerminalShortcutSettingsDialog(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .clickable {
-                                                draft = editing.copy(payload = command.id)
+                                                draft = editing.copy(
+                                                    payload = command.id,
+                                                    appendEnter = if (
+                                                        command.type == UserCommandType.KEY
+                                                    ) {
+                                                        false
+                                                    } else {
+                                                        editing.appendEnter
+                                                    },
+                                                )
                                             },
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
                                         RadioButton(
                                             selected = editing.payload == command.id,
                                             onClick = {
-                                                draft = editing.copy(payload = command.id)
+                                                draft = editing.copy(
+                                                    payload = command.id,
+                                                    appendEnter = if (
+                                                        command.type == UserCommandType.KEY
+                                                    ) {
+                                                        false
+                                                    } else {
+                                                        editing.appendEnter
+                                                    },
+                                                )
                                             },
                                         )
                                         Column(Modifier.weight(1f)) {
                                             Text(command.title)
                                             Text(
-                                                command.script.replace('\n', ' '),
+                                                command.actionSummary(),
                                                 maxLines = 1,
                                                 overflow =
                                                     androidx.compose.ui.text.style.TextOverflow
@@ -2552,7 +2921,10 @@ private fun TerminalShortcutSettingsDialog(
                             }
                         }
                     }
-                    if (editing.action != TerminalShortcutAction.BUILTIN) {
+                    if (
+                        editing.action != TerminalShortcutAction.BUILTIN &&
+                        boundLibraryCommand?.type != UserCommandType.KEY
+                    ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
                                 Text(

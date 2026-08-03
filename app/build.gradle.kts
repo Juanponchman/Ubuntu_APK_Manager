@@ -12,12 +12,15 @@ android {
         applicationId = "cn.termux.ubuntumanager"
         minSdk = 26
         targetSdk = 35
-        versionCode = 19
-        versionName = "1.16.0"
+        versionCode = 30
+        versionName = "2.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+        ndk {
+            abiFilters += "arm64-v8a"
         }
     }
 
@@ -47,6 +50,9 @@ android {
     }
 
     packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }

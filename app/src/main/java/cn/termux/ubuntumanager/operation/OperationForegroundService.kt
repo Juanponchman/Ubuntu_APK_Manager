@@ -81,12 +81,6 @@ class OperationForegroundService : Service() {
 
         try {
             app.preferences.setBackgroundOperation(runningRecord)
-            app.repository.ensureBackgroundOperationWakeLock()
-            val settings = app.preferences.snapshot()
-            if (settings.hideMaintenanceFromRecents) {
-                RecentTaskVisibility.setExcluded(this, true)
-            }
-
             val outcome = execute(request)
             app.preferences.setBackgroundOperation(
                 runningRecord.copy(
@@ -99,7 +93,6 @@ class OperationForegroundService : Service() {
                     message = outcome.message,
                 ),
             )
-            app.repository.reconcileTermuxWakeLock()
         } catch (cancelled: CancellationException) {
             app.preferences.setBackgroundOperation(
                 runningRecord.copy(
@@ -118,12 +111,10 @@ class OperationForegroundService : Service() {
                     message = "操作失败：$message",
                 ),
             )
-            app.repository.reconcileTermuxWakeLock()
             app.repository.showMessage("操作失败：$message")
         } finally {
             currentRequest = null
             activeOperationId = null
-            RecentTaskVisibility.setExcluded(this, false)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -149,7 +140,10 @@ class OperationForegroundService : Service() {
             BackgroundOperationType.INITIALIZE_SSH ->
                 repository.initializeSsh(instanceName())
             BackgroundOperationType.DELETE_INSTANCE -> repository.delete(instanceName())
-            BackgroundOperationType.BACKUP -> repository.backup(instanceName())
+            BackgroundOperationType.BACKUP -> repository.backup(
+                instanceName(),
+                requireNotNull(request.secondaryName) { "备份任务缺少备份名称" },
+            )
             BackgroundOperationType.RESTORE -> repository.restore(
                 requireNotNull(request.backup) { "恢复任务缺少备份信息" },
             )
@@ -170,7 +164,7 @@ class OperationForegroundService : Service() {
         .setSmallIcon(android.R.drawable.stat_sys_download)
         .setContentTitle("Ubuntu 管理器")
         .setContentText(label)
-        .setSubText("维护任务运行中，请勿结束 Termux")
+        .setSubText("Root Chroot 维护任务运行中")
         .setContentIntent(contentIntent())
         .setOngoing(true)
         .setOnlyAlertOnce(true)
@@ -212,7 +206,6 @@ class OperationForegroundService : Service() {
         activeOperationId = null
         operationJob?.cancel()
         serviceScope.cancel()
-        RecentTaskVisibility.setExcluded(this, false)
         super.onDestroy()
     }
 

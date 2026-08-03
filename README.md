@@ -1,98 +1,85 @@
-# Ubuntu 管理器
+# Ubuntu 管理器（Root Chroot）
 
-面向 Termux + PRoot Distro 5.x 的中文 Android 管理器。应用通过 Termux 官方
-`RunCommandService` 管理多个命名 Ubuntu 实例，日常运行不需要 Root、Tasker，也不修改
-Termux 源码。权限和存储初始化统一使用指定的 Magisk Alpha（包名
-`io.github.vvb2060.magisk`）执行固定操作，不兼容普通 Magisk。
+面向已取得 Magisk Alpha Root 的 Android 设备的中文 Ubuntu Chroot 管理器。
+运行时不依赖 Termux、`RUN_COMMAND` 或 `proot-distro`，由 APK 直接通过 Alpha Root
+管理 Ubuntu 实例。
 
-## 已实现
+## 架构
 
-- 检查 Termux、`RUN_COMMAND` 权限、外部调用和 PRoot Distro 5.x 功能。
-- 使用 Magisk Alpha 完成 `RUN_COMMAND`、外部调用和 Termux 存储权限配置。
-- 自动发现实例；首次发现的已有实例全部设为受保护。
-- 受保护实例可通过输入完整实例名解除保护，也可随时重新保护。
-- 结构化读取 PRoot 会话，前台自动刷新并分别显示实例和 SSH 状态。
-- 后台启动 SSH、普通停止和强制停止。
-- 创建多个 Ubuntu 24.04 ARM64 实例并分配独立 SSH 端口。
-- 在停止状态下重命名实例；修改 SSH 端口时支持安全重启和失败回滚。
-- 将停止的实例流式复制为独立实例，并重新生成 SSH 主机密钥和机器身份。
-- 安装/修复 `openssh-server`。
-- 内置中文指令库，支持自定义标签；点击指令后再选择实例，可安装常用网络、编辑、
-  编译、Python 和 Node.js 工具。
-- 内置免密码、免密钥的本机交互会话。首次使用会在所选 Ubuntu 中安装 ttyd 和
-  dtach，只监听 `127.0.0.1`；普通返回后会话继续在后台运行，重新进入会恢复记录，
-  也可显式结束。
-- 会话支持中文输入栏、方向键、Ctrl/Alt 一次与长按锁定、快捷指令、半透明滚动条、
-  当前/总行数、距最新行数和一键回到最新位置。
-- 停止状态下创建 `.tar.xz` 备份和 SHA-256 校验文件。
-- 新建、复制、备份、恢复、删除和耗时指令由独立前台服务持有；关闭或划掉界面不会
-  取消任务协调，任务状态会持久化，进程异常后只标记中断而不会自动重跑。
-- 备份先写入 `.partial`，完成校验后再原子发布 `.tar.xz` 和校验文件，避免把中断的
-  半成品显示为可恢复备份。
-- 可在维护任务期间临时隐藏最近任务卡片，并通过低干扰常驻通知返回任务；系统要求的
-  前台服务通知和 Termux 通知不会被 Root 隐藏。
-- 可在实例、会话或后台维护任务运行时自动持有一个 Termux 全局 WakeLock，也可选择
-  持续保持；状态会显示为待机、启用中、已持有、释放中或异常。并提供 Magisk Alpha
-  Android Doze 白名单、系统电池优化、MIUI 自启动和应用详情入口。
-- 存储页分项诊断 Termux 的读取、写入、所有文件访问、目录链接和实际写入状态。
-- 单独提供 Magisk Alpha 存储权限修复、目录链接创建和安全重建操作。
-- 校验并恢复普通实例。
-- 已解除保护且停止的实例允许删除，删除仍需输入完整名称。
-- 中文 Material 3 界面、深色模式和 Android 12 动态颜色。
-
-## 手机端准备
-
-Termux 中安装或升级：
-
-```sh
-pkg upgrade
-pkg install proot-distro
+```text
+Ubuntu 管理器 APK
+        ↓ Magisk Alpha su
+/data/adb/cntermux/chroot-supervisor.sh
+        ↓ 私有 mount namespace
+独立 ext4 实例镜像
+        ↓
+Ubuntu 24.04 / OpenSSH / tmux / ttyd / Nmap
 ```
 
-编辑 `~/.termux/termux.properties`，确保包含：
+开机启动不经过 APK 或 `su`：Magisk Alpha 直接执行
+`/data/adb/service.d/cntermux-autostart.sh`，读取经过校验的
+`/data/adb/cntermux/autostart.conf` 后启动已勾选实例。
 
-```properties
-allow-external-apps=true
+- 每个实例是一块独立的 8GB 稀疏 ext4 镜像，保存该实例的全部系统、软件和用户数据。
+- 所有实例共享 Android 宿主网络，因此能直接读取真实网卡和路由，并支持 Root Nmap
+  SYN、ARP 等扫描。不同实例必须使用不同的 SSH 端口。
+- 每个运行实例使用独立挂载命名空间。`/dev`、`/dev/pts`、`/proc` 和 `/sys` 只在该
+  命名空间内挂载，不污染 Android 全局挂载表。
+- 本地会话由实例内的 `ttyd + tmux` 提供；离开页面不会结束 tmux 会话，再次进入可继续。
+- Chroot 是运行环境，不是安全沙箱。实例内的 `root` 是设备上的真实 Root，只应运行可信程序。
+
+## 实例与备份目录
+
+```text
+/data/local/cntermux/
+├── images/      # <实例名>.img
+├── runtime/     # PID、端口和临时挂载点
+├── logs/        # supervisor、sshd 日志
+├── backups/     # 稀疏 ext4 备份镜像与 SHA-256
+└── cache/       # 已校验的 Ubuntu Base 下载缓存
 ```
 
-在应用中使用“Magisk Alpha 首次配置”。该入口只支持包名为
-`io.github.vvb2060.magisk` 且 `su -v` 返回 Alpha 标识的版本，
-不兼容普通 Magisk。使用前需要在 Alpha 的“配置排除列表”中取消勾选 Ubuntu 管理器。
-该操作会
-先备份 `termux.properties`，再授予 `RUN_COMMAND` 并启用外部调用。Root 仅用于这次
-固定配置，Ubuntu 和 PRoot 后续仍以普通应用权限运行。
+监督脚本安装在 `/data/adb/cntermux/chroot-supervisor.sh`，ARM64 原生维护工具安装在
+`/data/adb/cntermux/cntermux-sparsecopy`，负责稀疏复制和按 Chroot 根目录精确清理进程。
+实例停止后才能备份、恢复、复制、重命名或
+删除。备份直接复制 ext4 镜像的数据区，不逐个遍历或压缩实例内的小文件，也不会把镜像
+空洞扩展成真实占用；每份备份均生成 SHA-256 校验文件。复制器源码位于
+`app/src/main/cpp/sparsecopy.c`。
 
-如果备份目录仍不可写，请在“设置 → 备份与存储”查看五项诊断。系统权限与
-`~/storage` 目录链接分别处理：Alpha 存储修复只授予固定权限；Alpha 目录链接操作会
-把 Termux 拉到前台并调用 Termux 官方创建逻辑，不使用 Root 直接创建链接。安全重建
-发现 `~/storage` 内有普通文件或目录时会拒绝执行。以上操作均不会停止或删除 PRoot
-实例。
+## 开机自动启动
 
-完整管理功能要求 PRoot Distro 5.1 或更高版本，并需要 `ps`、`kill` 和
-`login --detach` 功能。
+- 设置页提供总开关，每个实例的高级设置提供独立开关。
+- Root 配置只接受安全实例名和 1024～65535 的端口，不执行配置中的 Shell 内容。
+- 脚本等待 `sys.boot_completed=1`，随后按顺序启动实例，每个实例最多尝试三次。
+- 已运行实例返回 `ALREADY_RUNNING`，不会创建第二套挂载或监督进程。
+- 开机阶段只启动 Chroot 和 SSH；`ttyd + tmux` 在进入本地会话时按需启动。
+- 启动日志位于 `/data/local/cntermux/logs/boot.log`，超过 1MB 时保留一份旧日志。
 
-## 数据安全
+## 新建实例
 
-- 首次发现的已有实例默认受保护；解除保护需要输入完整实例名。
-- 受保护实例不能删除、重命名，也不能由普通恢复流程覆盖。
-- 受保护实例可以备份、作为复制源、修改 SSH 端口和运行可信内置指令。
-- 备份保存在 `Download/UbuntuManager`。
-- 本地会话只连接当前手机上的所选 Ubuntu，不监听局域网地址，也不暴露 Android
-  Root Shell。会话内允许交互式命令，因此实例保护不能阻止用户在终端中修改文件。
-- 实例名和端口在调用 Termux 前会再次校验。
-- 检测到实例正在备份或执行其他维护任务时，不允许启动本地会话。
-- 停止实例会结束该实例的全部 PRoot 会话，包括用户手动打开的交互会话。
+管理器下载 Canonical 官方 Ubuntu Base 24.04.4 ARM64：
+
+`https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-arm64.tar.gz`
+
+内置 SHA-256：
+
+`04207713ece899c3740823d33690441ad3a7f0ded1101aca744e2b0f37ac7ff2`
+
+创建时自动安装 `openssh-server`、`tmux`、`ttyd`、`nmap`、`iproute2`、`procps`、
+`ca-certificates` 和 `zstd`。默认 SSH 账户为 `root`，默认密码为 `root1234`，可在实例
+高级操作中按需修改。
+
+## 与旧 Termux/PRoot 的关系
+
+本版本不迁移、不读取、不停止，也不删除旧 Termux/PRoot 实例。旧数据仍保留在 Termux
+私有目录中，但不会显示在本管理器内。用户确认不再需要后可自行处理 Termux；APK 的
+Root Chroot 实例与旧数据没有交叉。
 
 ## 构建
 
-需要 JDK 17 或更高版本和 Android SDK 35：
-
-```sh
-./gradlew assembleDebug
+```bash
+./gradlew test assembleDebug
 ```
 
-调试 APK 输出到：
-
-```text
-app/build/outputs/apk/debug/app-debug.apk
-```
+最低 Android 8（API 26），当前 APK 面向 ARM64，目标设备验证环境为 Redmi K20 Pro /
+Android 11 / Magisk Alpha。

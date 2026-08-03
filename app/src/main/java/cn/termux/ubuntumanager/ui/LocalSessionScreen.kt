@@ -4,10 +4,17 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
+import android.view.KeyEvent
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputConnectionWrapper
+import android.view.inputmethod.InputMethodManager
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
@@ -16,11 +23,19 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -37,23 +52,25 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -63,11 +80,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.semantics.Role
@@ -76,28 +96,39 @@ import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.zIndex
+import cn.termux.ubuntumanager.command.TerminalKeys
 import cn.termux.ubuntumanager.command.TerminalShortcuts
+import cn.termux.ubuntumanager.command.actionSummary
 import cn.termux.ubuntumanager.model.CommandTag
 import cn.termux.ubuntumanager.model.LocalSessionBackend
 import cn.termux.ubuntumanager.model.LocalSessionPhase
 import cn.termux.ubuntumanager.model.LocalSessionState
 import cn.termux.ubuntumanager.model.TerminalShortcutAction
 import cn.termux.ubuntumanager.model.TerminalShortcutPreference
+import cn.termux.ubuntumanager.model.TerminalKeyStroke
 import cn.termux.ubuntumanager.model.UserCommand
+import cn.termux.ubuntumanager.model.UserCommandType
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.util.Base64
+import kotlin.coroutines.resume
+import kotlin.math.roundToInt
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONObject
 
 @Composable
@@ -107,15 +138,15 @@ fun LocalSessionScreen(
     commands: List<UserCommand>,
     commandTags: List<CommandTag>,
     terminalShortcuts: List<TerminalShortcutPreference>,
-    operationInProgress: Boolean,
+    pendingKeyActionId: String?,
     onNavigateBack: () -> Unit,
     onOpenSession: () -> Unit,
     onCloseSession: () -> Unit,
     onEndSession: () -> Unit,
-    onRunCommand: (String) -> Unit,
+    onPendingKeyActionConsumed: () -> Unit,
 ) {
-    var terminalWebView by remember(instanceName) { mutableStateOf<WebView?>(null) }
-    var showCommands by remember { mutableStateOf(false) }
+    var terminalWebView by remember(instanceName) { mutableStateOf<TerminalInputWebView?>(null) }
+    var showCommands by rememberSaveable { mutableStateOf(false) }
     var ctrlMode by remember { mutableStateOf(TerminalModifierMode.OFF) }
     var altMode by remember { mutableStateOf(TerminalModifierMode.OFF) }
     var scrollState by remember { mutableStateOf(TerminalScrollState()) }
@@ -128,6 +159,10 @@ fun LocalSessionScreen(
         onOpenSession()
     }
     LaunchedEffect(ctrlMode, altMode) {
+        terminalWebView?.updateModifiers(
+            ctrlActive = ctrlMode != TerminalModifierMode.OFF,
+            altActive = altMode != TerminalModifierMode.OFF,
+        )
         terminalWebView?.evaluateJavascript(terminalModifierScript(ctrlMode, altMode), null)
     }
     DisposableEffect(instanceName) {
@@ -183,7 +218,14 @@ fun LocalSessionScreen(
         }
     }
 
-    fun sendTerminalKey(key: String, code: String, keyCode: Int) {
+    fun sendTerminalKey(
+        key: String,
+        code: String,
+        keyCode: Int,
+        ctrl: Boolean = false,
+        alt: Boolean = false,
+        shift: Boolean = false,
+    ) {
         val webView = terminalWebView
         if (webView == null || pageLoading) return
         val script = """
@@ -195,6 +237,9 @@ fun LocalSessionScreen(
                 code: ${JSONObject.quote(code)},
                 keyCode: $keyCode,
                 which: $keyCode,
+                ctrlKey: $ctrl,
+                altKey: $alt,
+                shiftKey: $shift,
                 bubbles: true,
                 cancelable: true
               };
@@ -212,11 +257,47 @@ fun LocalSessionScreen(
             sendToTerminal(value)
             return
         }
-        var output = if (ctrlActive) value.asControlSequence() else value
-        if (altActive) output = "\u001b$output"
-        sendToTerminal(output)
+        sendToTerminal(TerminalKeys.applyModifiers(value, ctrlActive, altActive))
         if (ctrlMode == TerminalModifierMode.ONCE) ctrlMode = TerminalModifierMode.OFF
         if (altMode == TerminalModifierMode.ONCE) altMode = TerminalModifierMode.OFF
+    }
+
+    fun sendKeyStroke(stroke: TerminalKeyStroke) {
+        val option = TerminalKeys.option(stroke.key) ?: return
+        val ctrlActive = stroke.ctrl || ctrlMode != TerminalModifierMode.OFF
+        val altActive = stroke.alt || altMode != TerminalModifierMode.OFF
+        val printable = TerminalKeys.printableText(stroke)
+        if (printable != null) {
+            sendToTerminal(TerminalKeys.applyModifiers(printable, ctrlActive, altActive))
+        } else {
+            sendTerminalKey(
+                key = option.javascriptKey,
+                code = option.javascriptCode,
+                keyCode = option.keyCode,
+                ctrl = ctrlActive,
+                alt = altActive,
+                shift = stroke.shift,
+            )
+        }
+        if (ctrlMode == TerminalModifierMode.ONCE) ctrlMode = TerminalModifierMode.OFF
+        if (altMode == TerminalModifierMode.ONCE) altMode = TerminalModifierMode.OFF
+    }
+
+    LaunchedEffect(pendingKeyActionId, pageLoading, terminalWebView) {
+        val actionId = pendingKeyActionId ?: return@LaunchedEffect
+        val webView = terminalWebView ?: return@LaunchedEffect
+        if (pageLoading) return@LaunchedEffect
+        val command = commands.firstOrNull {
+            it.id == actionId && it.type == UserCommandType.KEY
+        }
+        if (command?.keyStroke != null) {
+            if (webView.awaitTerminalInput()) {
+                sendKeyStroke(command.keyStroke)
+            } else {
+                Toast.makeText(context, "终端未就绪，按键没有发送", Toast.LENGTH_SHORT).show()
+            }
+        }
+        onPendingKeyActionConsumed()
     }
 
     when {
@@ -346,20 +427,21 @@ fun LocalSessionScreen(
                                 .padding(vertical = 6.dp)
                                 .zIndex(2f),
                         )
-                        TerminalPositionBadge(
-                            state = scrollState,
-                            onReturnToLatest = {
-                                terminalWebView?.evaluateJavascript(
-                                    "window.__ubuntuScrollToLatest && " +
-                                        "window.__ubuntuScrollToLatest();",
-                                    null,
-                                )
-                            },
-                            modifier = Modifier
-                                .align(Alignment.BottomEnd)
-                                .padding(end = 18.dp, bottom = 10.dp)
-                                .zIndex(1f),
-                        )
+                        if (shouldShowReturnToLatest(scrollState.atBottom)) {
+                            ReturnToLatestBadge(
+                                onClick = {
+                                    terminalWebView?.evaluateJavascript(
+                                        "window.__ubuntuScrollToLatest && " +
+                                            "window.__ubuntuScrollToLatest();",
+                                        null,
+                                    )
+                                },
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(end = 18.dp, bottom = 10.dp)
+                                    .zIndex(3f),
+                            )
+                        }
                     }
                 }
                 val enabledShortcuts = terminalShortcuts.filter { it.enabled }
@@ -412,11 +494,15 @@ fun LocalSessionScreen(
                                                 )
                                                 TerminalShortcuts.ESC ->
                                                     TerminalKey(shortcut.label, modifier) {
-                                                        sendTerminalKey("Escape", "Escape", 27)
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.ESCAPE),
+                                                        )
                                                     }
                                                 TerminalShortcuts.TAB ->
                                                     TerminalKey(shortcut.label, modifier) {
-                                                        sendTerminalKey("Tab", "Tab", 9)
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.TAB),
+                                                        )
                                                     }
                                                 TerminalShortcuts.BACKSPACE ->
                                                     TerminalRepeatingKey(
@@ -424,10 +510,10 @@ fun LocalSessionScreen(
                                                         modifier = modifier,
                                                         contentDescription = "退格",
                                                     ) {
-                                                        sendTerminalKey(
-                                                            "Backspace",
-                                                            "Backspace",
-                                                            8,
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(
+                                                                TerminalKeys.BACKSPACE,
+                                                            ),
                                                         )
                                                     }
                                                 TerminalShortcuts.DELETE ->
@@ -436,38 +522,38 @@ fun LocalSessionScreen(
                                                         modifier = modifier,
                                                         contentDescription = "向前删除",
                                                     ) {
-                                                        sendTerminalKey("Delete", "Delete", 46)
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.DELETE),
+                                                        )
                                                     }
                                                 TerminalShortcuts.ENTER ->
                                                     TerminalKey(shortcut.label, modifier) {
-                                                        sendTerminalKey("Enter", "Enter", 13)
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.ENTER),
+                                                        )
                                                     }
                                                 TerminalShortcuts.LEFT ->
                                                     TerminalKey(shortcut.label, modifier) {
-                                                        sendTerminalKey(
-                                                            "ArrowLeft",
-                                                            "ArrowLeft",
-                                                            37,
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.LEFT),
                                                         )
                                                     }
                                                 TerminalShortcuts.UP ->
                                                     TerminalKey(shortcut.label, modifier) {
-                                                        sendTerminalKey("ArrowUp", "ArrowUp", 38)
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.UP),
+                                                        )
                                                     }
                                                 TerminalShortcuts.DOWN ->
                                                     TerminalKey(shortcut.label, modifier) {
-                                                        sendTerminalKey(
-                                                            "ArrowDown",
-                                                            "ArrowDown",
-                                                            40,
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.DOWN),
                                                         )
                                                     }
                                                 TerminalShortcuts.RIGHT ->
                                                     TerminalKey(shortcut.label, modifier) {
-                                                        sendTerminalKey(
-                                                            "ArrowRight",
-                                                            "ArrowRight",
-                                                            39,
+                                                        sendKeyStroke(
+                                                            TerminalKeyStroke(TerminalKeys.RIGHT),
                                                         )
                                                     }
                                                 TerminalShortcuts.COMMANDS ->
@@ -500,14 +586,18 @@ fun LocalSessionScreen(
                                                 enabled = command != null,
                                             ) {
                                                 command?.let {
-                                                    sendToTerminal(
-                                                        it.asTerminalLine() +
-                                                            if (shortcut.appendEnter) {
-                                                                "\r"
-                                                            } else {
-                                                                ""
-                                                            },
-                                                    )
+                                                    if (it.type == UserCommandType.KEY) {
+                                                        it.keyStroke?.let(::sendKeyStroke)
+                                                    } else {
+                                                        sendToTerminal(
+                                                            it.asTerminalLine() +
+                                                                if (shortcut.appendEnter) {
+                                                                    "\r"
+                                                                } else {
+                                                                    ""
+                                                                },
+                                                        )
+                                                    }
                                                 }
                                             }
                                         }
@@ -525,15 +615,14 @@ fun LocalSessionScreen(
         SessionCommandSheet(
             commands = commands,
             commandTags = commandTags,
-            operationInProgress = operationInProgress,
             onDismiss = { showCommands = false },
-            onInsert = { command ->
+            onActivate = { command ->
                 showCommands = false
-                sendToTerminal(command.asTerminalLine())
-            },
-            onRun = { command ->
-                showCommands = false
-                onRunCommand(command.id)
+                if (command.type == UserCommandType.KEY) {
+                    command.keyStroke?.let(::sendKeyStroke)
+                } else {
+                    sendToTerminal(command.asTerminalLine() + "\r")
+                }
             },
         )
     }
@@ -656,6 +745,8 @@ internal fun terminalShortcutColumnCount(
         (minimumButtonWidthDp + spacingDp)).toInt().coerceAtLeast(1)
     return fittingColumns.coerceAtMost(enabledCount)
 }
+
+internal fun shouldShowReturnToLatest(atBottom: Boolean): Boolean = !atBottom
 
 @Composable
 private fun TerminalKey(
@@ -782,28 +873,22 @@ private fun TerminalModifierKey(
 }
 
 @Composable
-private fun TerminalPositionBadge(
-    state: TerminalScrollState,
-    onReturnToLatest: () -> Unit,
+private fun ReturnToLatestBadge(
+    onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val position = state.position.coerceAtLeast(1)
-    val total = state.total.coerceAtLeast(position)
-    val text = when {
-        state.reviewing && state.atBottom -> "已到最新 · 观察中"
-        state.reviewing -> "历史观察 · 距最新 ${total - position} 行"
-        else -> "● 当前输入 · $position/$total"
-    }
     Box(
         modifier = modifier
-            .background(
-                if (state.reviewing) Color(0xC47A5313) else Color(0xB81B5E42),
-                RoundedCornerShape(14.dp),
-            )
-            .clickable(onClick = onReturnToLatest)
+            .background(Color(0xC47A5313), RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 5.dp),
+        contentAlignment = Alignment.Center,
     ) {
-        Text(text, color = Color.White, fontSize = 11.sp)
+        Text(
+            text = "回到最新",
+            color = Color.White,
+            fontSize = 11.sp,
+        )
     }
 }
 
@@ -837,21 +922,109 @@ private fun TerminalScrollbar(
     }
 }
 
-private fun String.asControlSequence(): String {
-    if (isEmpty()) return this
-    val character = first()
-    val code = when (character.uppercaseChar()) {
-        in 'A'..'Z' -> character.uppercaseChar().code - 'A'.code + 1
-        '@', ' ' -> 0
-        '[' -> 27
-        '\\' -> 28
-        ']' -> 29
-        '^' -> 30
-        '_' -> 31
-        '?' -> 127
-        else -> return this
+private class TerminalInputWebView(context: Context) : WebView(context) {
+    var onNativeModifiedInput: ((String) -> Unit)? = null
+
+    private var ctrlActive = false
+    private var altActive = false
+    private var captureConsumed = false
+    private var inputConnectionGeneration = 0
+    private var blockedThroughGeneration = 0
+
+    private val commandMode: Boolean
+        get() = ctrlActive || altActive
+
+    fun updateModifiers(ctrlActive: Boolean, altActive: Boolean) {
+        if (this.ctrlActive == ctrlActive && this.altActive == altActive) return
+        val wasCommandMode = commandMode
+        this.ctrlActive = ctrlActive
+        this.altActive = altActive
+        captureConsumed = false
+        if (wasCommandMode && !commandMode) {
+            blockedThroughGeneration = inputConnectionGeneration
+        }
+        post {
+            val inputManager =
+                context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            inputManager.restartInput(this)
+        }
     }
-    return code.toChar().toString()
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+        val base = super.onCreateInputConnection(outAttrs) ?: return null
+        val generation = ++inputConnectionGeneration
+        if (commandMode) {
+            outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            outAttrs.imeOptions = outAttrs.imeOptions or
+                EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        }
+        return object : InputConnectionWrapper(base, false) {
+            override fun setComposingText(
+                text: CharSequence?,
+                newCursorPosition: Int,
+            ): Boolean = if (captureImeText(text, generation)) {
+                true
+            } else {
+                super.setComposingText(text, newCursorPosition)
+            }
+
+            override fun commitText(
+                text: CharSequence?,
+                newCursorPosition: Int,
+            ): Boolean = if (captureImeText(text, generation)) {
+                true
+            } else {
+                super.commitText(text, newCursorPosition)
+            }
+
+            override fun sendKeyEvent(event: KeyEvent): Boolean {
+                if (generation <= blockedThroughGeneration) return true
+                if (commandMode && event.action == KeyEvent.ACTION_DOWN) {
+                    val unicode = event.unicodeChar
+                    if (unicode in 32..126) {
+                        captureImeText(unicode.toChar().toString(), generation)
+                        return true
+                    }
+                }
+                if (commandMode && captureConsumed) return true
+                return super.sendKeyEvent(event)
+            }
+
+            override fun deleteSurroundingText(
+                beforeLength: Int,
+                afterLength: Int,
+            ): Boolean = if (generation <= blockedThroughGeneration || commandMode) {
+                true
+            } else {
+                super.deleteSurroundingText(beforeLength, afterLength)
+            }
+
+            override fun deleteSurroundingTextInCodePoints(
+                beforeLength: Int,
+                afterLength: Int,
+            ): Boolean = if (generation <= blockedThroughGeneration || commandMode) {
+                true
+            } else {
+                super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)
+            }
+        }
+    }
+
+    private fun captureImeText(text: CharSequence?, generation: Int): Boolean {
+        if (generation <= blockedThroughGeneration) return true
+        if (!commandMode) return false
+        if (captureConsumed) return true
+        val value = text?.firstOrNull { it.code in 32..126 }?.toString()
+        if (value != null) {
+            captureConsumed = true
+            blockedThroughGeneration = generation
+            post { onNativeModifiedInput?.invoke(value) }
+        }
+        return true
+    }
 }
 
 @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
@@ -860,7 +1033,7 @@ private fun LocalTerminalWebView(
     url: String,
     port: Int,
     backend: LocalSessionBackend,
-    onWebViewReady: (WebView) -> Unit,
+    onWebViewReady: (TerminalInputWebView) -> Unit,
     onPageLoading: (Boolean) -> Unit,
     onPageError: (String) -> Unit,
     ctrlMode: TerminalModifierMode,
@@ -897,7 +1070,7 @@ private fun LocalTerminalWebView(
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
-            WebView(context).apply {
+            TerminalInputWebView(context).apply {
                 layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT,
@@ -911,6 +1084,11 @@ private fun LocalTerminalWebView(
                 settings.setSupportMultipleWindows(false)
                 settings.mediaPlaybackRequiresUserGesture = true
                 settings.safeBrowsingEnabled = true
+                onNativeModifiedInput = { currentModifiedInput.value(it) }
+                updateModifiers(
+                    ctrlActive = ctrlMode != TerminalModifierMode.OFF,
+                    altActive = altMode != TerminalModifierMode.OFF,
+                )
                 addJavascriptInterface(bridge, TERMINAL_BRIDGE_NAME)
                 webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(
@@ -968,6 +1146,10 @@ private fun LocalTerminalWebView(
         },
         update = { view ->
             if (view.url != url) view.loadUrl(url)
+            view.updateModifiers(
+                ctrlActive = ctrlMode != TerminalModifierMode.OFF,
+                altActive = altMode != TerminalModifierMode.OFF,
+            )
             view.evaluateJavascript(
                 terminalPageStateScript(ctrlMode, altMode, backend),
                 null,
@@ -1033,6 +1215,21 @@ private fun terminalPageStateScript(
 
 private fun Uri.isAllowedLocalSessionUri(port: Int): Boolean =
     scheme == "http" && host == "127.0.0.1" && this.port == port
+
+private suspend fun WebView.awaitTerminalInput(): Boolean {
+    repeat(40) {
+        val ready = suspendCancellableCoroutine { continuation ->
+            evaluateJavascript(
+                "document.querySelector('.xterm-helper-textarea') !== null",
+            ) { result ->
+                if (continuation.isActive) continuation.resume(result == "true")
+            }
+        }
+        if (ready) return true
+        delay(100)
+    }
+    return false
+}
 
 private fun loadCompatibleTerminalPage(url: String): WebResourceResponse? = runCatching {
     val connection = URL(url).openConnection() as HttpURLConnection
@@ -1239,7 +1436,6 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
         !value || value.length !== 1 || value.charCodeAt(0) > 127) {
       return false;
     }
-    if (event && (event.isComposing || event.keyCode === 229)) return false;
     if (event) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -1815,90 +2011,349 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
 </script>
 """
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SessionCommandSheet(
     commands: List<UserCommand>,
     commandTags: List<CommandTag>,
-    operationInProgress: Boolean,
     onDismiss: () -> Unit,
-    onInsert: (UserCommand) -> Unit,
-    onRun: (UserCommand) -> Unit,
+    onActivate: (UserCommand) -> Unit,
 ) {
-    var selectedTagId by remember { mutableStateOf<String?>(null) }
+    var selectedTagId by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmCandidate by remember { mutableStateOf<UserCommand?>(null) }
+    val commandListState = rememberLazyListState()
     val filteredCommands = commands.filter { command ->
         selectedTagId == null || selectedTagId in command.tagIds
     }
+    val configuration = LocalConfiguration.current
+    val landscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
+    fun requestActivation(command: UserCommand) {
+        if (command.confirmBeforeRun) {
+            confirmCandidate = command
+        } else {
+            onActivate(command)
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = true,
+        ),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.38f)),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(onDismiss) {
+                        detectTapGestures { onDismiss() }
+                    },
+            )
+
+            if (landscape) {
+                LandscapeCommandPanel(
+                    modifier = Modifier.align(Alignment.CenterEnd),
+                    commands = commands,
+                    filteredCommands = filteredCommands,
+                    commandTags = commandTags,
+                    selectedTagId = selectedTagId,
+                    onSelectTag = { selectedTagId = it },
+                    onActivate = ::requestActivation,
+                    onDismiss = onDismiss,
+                    commandListState = commandListState,
+                )
+            } else {
+                PortraitCommandPanel(
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                    commands = commands,
+                    filteredCommands = filteredCommands,
+                    commandTags = commandTags,
+                    selectedTagId = selectedTagId,
+                    onSelectTag = { selectedTagId = it },
+                    onActivate = ::requestActivation,
+                    commandListState = commandListState,
+                )
+            }
+        }
+    }
+
+    confirmCandidate?.let { command ->
+        AlertDialog(
+            onDismissRequest = { confirmCandidate = null },
+            title = {
+                Text(
+                    command.title,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            },
+            text = {
+                Text(
+                    command.actionSummary(),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmCandidate = null
+                        onActivate(command)
+                    },
+                ) {
+                    Text(if (command.type == UserCommandType.KEY) "发送" else "执行")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmCandidate = null }) {
+                    Text("取消")
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun PortraitCommandPanel(
+    commands: List<UserCommand>,
+    filteredCommands: List<UserCommand>,
+    commandTags: List<CommandTag>,
+    selectedTagId: String?,
+    onSelectTag: (String?) -> Unit,
+    onActivate: (UserCommand) -> Unit,
+    commandListState: LazyListState,
+    modifier: Modifier = Modifier,
+) {
+    var visible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { visible = true }
+
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = slideInVertically(initialOffsetY = { it }),
+    ) {
+        Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 20.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .fillMaxHeight(0.50f),
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 2.dp,
         ) {
-            Text(
-                "当前实例快捷指令",
-                modifier = Modifier.padding(horizontal = 16.dp),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
+            SessionCommandContent(
+                commands = commands,
+                filteredCommands = filteredCommands,
+                commandTags = commandTags,
+                selectedTagId = selectedTagId,
+                onSelectTag = onSelectTag,
+                onActivate = onActivate,
+                commandListState = commandListState,
             )
-            LazyRow(
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                item {
-                    FilterChip(
-                        selected = selectedTagId == null,
-                        onClick = { selectedTagId = null },
-                        label = { Text("全部") },
-                    )
-                }
-                items(commandTags, key = { it.id }) { tag ->
-                    FilterChip(
-                        selected = selectedTagId == tag.id,
-                        onClick = { selectedTagId = tag.id },
-                        label = { Text(tag.name) },
+        }
+    }
+}
+
+@Composable
+private fun LandscapeCommandPanel(
+    commands: List<UserCommand>,
+    filteredCommands: List<UserCommand>,
+    commandTags: List<CommandTag>,
+    selectedTagId: String?,
+    onSelectTag: (String?) -> Unit,
+    onActivate: (UserCommand) -> Unit,
+    onDismiss: () -> Unit,
+    commandListState: LazyListState,
+    modifier: Modifier = Modifier,
+) {
+    var visible by remember { mutableStateOf(false) }
+    var panelWidthPx by remember { mutableStateOf(1f) }
+    var horizontalOffsetPx by remember { mutableStateOf(0f) }
+    val draggableState = rememberDraggableState { delta ->
+        horizontalOffsetPx = (horizontalOffsetPx + delta).coerceIn(0f, panelWidthPx)
+    }
+
+    LaunchedEffect(Unit) { visible = true }
+
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier.offset {
+            IntOffset(horizontalOffsetPx.roundToInt(), 0)
+        },
+        enter = slideInHorizontally(initialOffsetX = { it }),
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.40f)
+                .fillMaxHeight()
+                .onSizeChanged { panelWidthPx = it.width.toFloat().coerceAtLeast(1f) },
+            shape = RoundedCornerShape(topStart = 24.dp, bottomStart = 24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 4.dp,
+        ) {
+            Box {
+                SessionCommandContent(
+                    commands = commands,
+                    filteredCommands = filteredCommands,
+                    commandTags = commandTags,
+                    selectedTagId = selectedTagId,
+                    onSelectTag = onSelectTag,
+                    onActivate = onActivate,
+                    commandListState = commandListState,
+                )
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .width(22.dp)
+                        .fillMaxHeight()
+                        .draggable(
+                            state = draggableState,
+                            orientation = Orientation.Horizontal,
+                            onDragStopped = { velocity ->
+                                val dismiss = horizontalOffsetPx >= panelWidthPx * 0.22f ||
+                                    velocity > 900f
+                                val destination = if (dismiss) panelWidthPx else 0f
+                                Animatable(horizontalOffsetPx).animateTo(
+                                    targetValue = destination,
+                                    animationSpec = tween(durationMillis = 160),
+                                ) {
+                                    horizontalOffsetPx = value
+                                }
+                                if (dismiss) onDismiss()
+                            },
+                        ),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .width(4.dp)
+                            .height(48.dp)
+                            .background(
+                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.32f),
+                                RoundedCornerShape(2.dp),
+                            ),
                     )
                 }
             }
-            HorizontalDivider()
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 440.dp),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(filteredCommands, key = { it.id }) { command ->
-                    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
-                        Column(
-                            modifier = Modifier.padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Text(command.title, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun SessionCommandContent(
+    commands: List<UserCommand>,
+    filteredCommands: List<UserCommand>,
+    commandTags: List<CommandTag>,
+    selectedTagId: String?,
+    onSelectTag: (String?) -> Unit,
+    onActivate: (UserCommand) -> Unit,
+    commandListState: LazyListState,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(top = 8.dp, bottom = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        LazyRow(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            item {
+                FilterChip(
+                    selected = selectedTagId == null,
+                    onClick = { onSelectTag(null) },
+                    label = {
+                        Text("全部", style = MaterialTheme.typography.labelSmall)
+                    },
+                    modifier = Modifier.height(32.dp),
+                )
+            }
+            items(commandTags, key = { it.id }) { tag ->
+                FilterChip(
+                    selected = selectedTagId == tag.id,
+                    onClick = { onSelectTag(tag.id) },
+                    label = {
+                        Text(
+                            tag.name,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1,
+                        )
+                    },
+                    modifier = Modifier.height(32.dp),
+                )
+            }
+        }
+        HorizontalDivider()
+        LazyColumn(
+            state = commandListState,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+        ) {
+            if (filteredCommands.isEmpty()) {
+                item {
+                    Text(
+                        if (commands.isEmpty()) {
+                            "还没有快捷指令，请先在指令页面创建。"
+                        } else {
+                            "当前标签下没有指令。"
+                        },
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 18.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            itemsIndexed(filteredCommands, key = { _, command -> command.id }) {
+                    index, command ->
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onActivate(command) }
+                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                command.script.replace('\n', ' '),
-                                style = MaterialTheme.typography.bodySmall,
-                                maxLines = 2,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                command.title,
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.End,
-                            ) {
-                                TextButton(onClick = { onInsert(command) }) {
-                                    Text("插入终端")
-                                }
-                                TextButton(
-                                    onClick = { onRun(command) },
-                                    enabled = !operationInProgress,
-                                ) {
-                                    Text("后台执行")
-                                }
+                            if (command.confirmBeforeRun) {
+                                Text(
+                                    "需确认",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
                             }
                         }
+                        Text(
+                            command.actionSummary(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (index < filteredCommands.lastIndex) {
+                        HorizontalDivider(modifier = Modifier.padding(horizontal = 12.dp))
                     }
                 }
             }

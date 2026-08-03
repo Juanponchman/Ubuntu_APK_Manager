@@ -37,6 +37,9 @@ data class BackgroundOperationRequest(
                 target.putExtra(EXTRA_BACKUP_SIZE, entry.sizeBytes)
                 target.putExtra(EXTRA_BACKUP_MODIFIED, entry.modifiedEpochSeconds)
                 target.putExtra(EXTRA_BACKUP_CHECKSUM, entry.checksumPresent)
+                target.putExtra(EXTRA_BACKUP_DISPLAY_NAME, entry.displayName)
+                target.putExtra(EXTRA_BACKUP_LOGICAL_SIZE, entry.logicalSizeBytes)
+                target.putExtra(EXTRA_BACKUP_METADATA, entry.metadataPresent)
             }
         }
 
@@ -57,6 +60,9 @@ data class BackgroundOperationRequest(
         private const val EXTRA_BACKUP_SIZE = "background_operation_backup_size"
         private const val EXTRA_BACKUP_MODIFIED = "background_operation_backup_modified"
         private const val EXTRA_BACKUP_CHECKSUM = "background_operation_backup_checksum"
+        private const val EXTRA_BACKUP_DISPLAY_NAME = "background_operation_backup_display_name"
+        private const val EXTRA_BACKUP_LOGICAL_SIZE = "background_operation_backup_logical_size"
+        private const val EXTRA_BACKUP_METADATA = "background_operation_backup_metadata"
 
         private val ID_PATTERN = Regex("[A-Za-z0-9_-]{1,64}")
 
@@ -77,6 +83,10 @@ data class BackgroundOperationRequest(
                     sizeBytes = intent.getLongExtra(EXTRA_BACKUP_SIZE, 0),
                     modifiedEpochSeconds = intent.getLongExtra(EXTRA_BACKUP_MODIFIED, 0),
                     checksumPresent = intent.getBooleanExtra(EXTRA_BACKUP_CHECKSUM, false),
+                    displayName = intent.getStringExtra(EXTRA_BACKUP_DISPLAY_NAME)
+                        ?: intent.getStringExtra(EXTRA_BACKUP_INSTANCE) ?: return null,
+                    logicalSizeBytes = intent.getLongExtra(EXTRA_BACKUP_LOGICAL_SIZE, 0),
+                    metadataPresent = intent.getBooleanExtra(EXTRA_BACKUP_METADATA, false),
                 )
             }
             return BackgroundOperationRequest(
@@ -129,10 +139,11 @@ data class BackgroundOperationRequest(
             instanceName = name,
         )
 
-        fun backup(name: String) = BackgroundOperationRequest(
+        fun backup(name: String, displayName: String) = BackgroundOperationRequest(
             type = BackgroundOperationType.BACKUP,
-            label = "正在备份 $name",
+            label = "正在备份 $displayName",
             instanceName = name,
+            secondaryName = displayName,
         )
 
         fun restore(backup: BackupEntry) = BackgroundOperationRequest(

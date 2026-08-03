@@ -4,18 +4,23 @@ import android.content.Context
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import cn.termux.ubuntumanager.command.TerminalKeys
 import cn.termux.ubuntumanager.command.TerminalShortcuts
 import cn.termux.ubuntumanager.model.BackgroundOperationRecord
 import cn.termux.ubuntumanager.model.BackgroundOperationStatus
 import cn.termux.ubuntumanager.model.BackgroundOperationType
+import cn.termux.ubuntumanager.model.BackupEntry
 import cn.termux.ubuntumanager.model.CommandHistoryEntry
 import cn.termux.ubuntumanager.model.CommandTag
 import cn.termux.ubuntumanager.model.TerminalShortcutAction
 import cn.termux.ubuntumanager.model.TerminalShortcutPreference
+import cn.termux.ubuntumanager.model.TerminalKeyStroke
 import cn.termux.ubuntumanager.model.UserCommand
+import cn.termux.ubuntumanager.model.UserCommandType
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 import kotlinx.coroutines.flow.Flow
@@ -34,12 +39,13 @@ data class RegistrySnapshot(
     val commandTags: List<CommandTag> = emptyList(),
     val terminalShortcuts: List<TerminalShortcutPreference> = TerminalShortcuts.defaults,
     val firstDiscoveryCompleted: Boolean = false,
-    val externalAppsConfigured: Boolean = false,
     val dynamicColors: Boolean = true,
-    val hideMaintenanceFromRecents: Boolean = true,
-    val termuxBackgroundProtection: Boolean = true,
-    val termuxWakeLockAlwaysOn: Boolean = false,
-    val termuxBackgroundProtectionActive: Boolean = false,
+    val hideFromRecentsWhenBackground: Boolean = true,
+    val autoStartBackendReady: Boolean = false,
+    val autoStartEnabled: Boolean = false,
+    val autoStartNames: Set<String> = emptySet(),
+    val backupRetentionCount: Int = 0,
+    val backups: List<BackupEntry> = emptyList(),
     val backgroundOperation: BackgroundOperationRecord? = null,
 )
 
@@ -54,16 +60,15 @@ class AppPreferences(private val context: Context) {
         val commandTags = stringPreferencesKey("command_tags")
         val terminalShortcuts = stringPreferencesKey("terminal_shortcuts")
         val firstDiscoveryCompleted = booleanPreferencesKey("first_discovery_completed")
-        val externalAppsConfigured = booleanPreferencesKey("external_apps_configured")
         val dynamicColors = booleanPreferencesKey("dynamic_colors")
-        val hideMaintenanceFromRecents =
+        // Keep the original persisted key so upgrades preserve the user's choice.
+        val hideFromRecentsWhenBackground =
             booleanPreferencesKey("hide_maintenance_from_recents")
-        val termuxBackgroundProtection =
-            booleanPreferencesKey("termux_background_protection")
-        val termuxWakeLockAlwaysOn =
-            booleanPreferencesKey("termux_wake_lock_always_on")
-        val termuxBackgroundProtectionActive =
-            booleanPreferencesKey("termux_background_protection_active")
+        val autoStartBackendReady = booleanPreferencesKey("auto_start_backend_ready")
+        val autoStartEnabled = booleanPreferencesKey("auto_start_enabled")
+        val autoStartNames = stringSetPreferencesKey("auto_start_names")
+        val backupRetentionCount = intPreferencesKey("backup_retention_count")
+        val backups = stringPreferencesKey("backup_catalog")
         val backgroundOperation = stringPreferencesKey("background_operation")
     }
 
@@ -107,6 +112,7 @@ class AppPreferences(private val context: Context) {
             values[Keys.protectedNames] = values[Keys.protectedNames].orEmpty() - name
             values[Keys.unprotectedNames] = values[Keys.unprotectedNames].orEmpty() - name
             values[Keys.ports] = encodePorts(decodePorts(values[Keys.ports]) - name)
+            values[Keys.autoStartNames] = values[Keys.autoStartNames].orEmpty() - name
         }
     }
 
@@ -136,6 +142,8 @@ class AppPreferences(private val context: Context) {
                 values[Keys.protectedNames].orEmpty().renameEntry(oldName, newName)
             values[Keys.unprotectedNames] =
                 values[Keys.unprotectedNames].orEmpty().renameEntry(oldName, newName)
+            values[Keys.autoStartNames] =
+                values[Keys.autoStartNames].orEmpty().renameEntry(oldName, newName)
             val ports = decodePorts(values[Keys.ports]).toMutableMap()
             ports.remove(oldName)?.let { ports[newName] = it }
             values[Keys.ports] = encodePorts(ports)
@@ -186,14 +194,29 @@ class AppPreferences(private val context: Context) {
         require(title.isNotEmpty() && title.length <= MAX_COMMAND_TITLE_LENGTH) {
             "指令名称必须为 1～$MAX_COMMAND_TITLE_LENGTH 个字符"
         }
-        require(script.isNotEmpty() && script.length <= MAX_COMMAND_SCRIPT_LENGTH) {
-            "命令必须为 1～$MAX_COMMAND_SCRIPT_LENGTH 个字符"
+        when (command.type) {
+            UserCommandType.COMMAND -> require(
+                script.isNotEmpty() && script.length <= MAX_COMMAND_SCRIPT_LENGTH,
+            ) {
+                "命令必须为 1～$MAX_COMMAND_SCRIPT_LENGTH 个字符"
+            }
+            UserCommandType.KEY -> require(TerminalKeys.isValid(command.keyStroke)) {
+                "请选择有效的终端按键"
+            }
         }
         val available = snapshot().commandTags.map { it.id }.toSet()
         require(command.tagIds.all { it in available }) { "包含不存在的标签" }
         context.dataStore.edit { values ->
             val commands = decodeCommands(values[Keys.commands]).toMutableList()
-            val normalized = command.copy(title = title, script = script)
+            val normalized = command.copy(
+                title = title,
+                script = if (command.type == UserCommandType.COMMAND) script else "",
+                keyStroke = if (command.type == UserCommandType.KEY) {
+                    command.keyStroke
+                } else {
+                    null
+                },
+            )
             val index = commands.indexOfFirst { it.id == command.id }
             if (index >= 0) {
                 commands[index] = normalized
@@ -253,24 +276,35 @@ class AppPreferences(private val context: Context) {
         context.dataStore.edit { it[Keys.dynamicColors] = enabled }
     }
 
-    suspend fun setExternalAppsConfigured(configured: Boolean) {
-        context.dataStore.edit { it[Keys.externalAppsConfigured] = configured }
+    suspend fun setHideFromRecentsWhenBackground(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.hideFromRecentsWhenBackground] = enabled }
     }
 
-    suspend fun setHideMaintenanceFromRecents(enabled: Boolean) {
-        context.dataStore.edit { it[Keys.hideMaintenanceFromRecents] = enabled }
+    suspend fun setAutoStartSnapshot(
+        backendReady: Boolean,
+        enabled: Boolean,
+        names: Set<String>,
+    ) {
+        context.dataStore.edit { values ->
+            values[Keys.autoStartBackendReady] = backendReady
+            values[Keys.autoStartEnabled] = enabled
+            values[Keys.autoStartNames] = names
+        }
     }
 
-    suspend fun setTermuxBackgroundProtection(enabled: Boolean) {
-        context.dataStore.edit { it[Keys.termuxBackgroundProtection] = enabled }
+    suspend fun setBackupRetentionCount(count: Int) {
+        require(count == 0 || count in 2..10) { "备份保留数量必须为关闭或 2～10 份" }
+        context.dataStore.edit { it[Keys.backupRetentionCount] = count }
     }
 
-    suspend fun setTermuxWakeLockAlwaysOn(enabled: Boolean) {
-        context.dataStore.edit { it[Keys.termuxWakeLockAlwaysOn] = enabled }
-    }
-
-    suspend fun setTermuxBackgroundProtectionActive(active: Boolean) {
-        context.dataStore.edit { it[Keys.termuxBackgroundProtectionActive] = active }
+    suspend fun saveBackups(backups: List<BackupEntry>) {
+        context.dataStore.edit { values ->
+            values[Keys.backups] = encodeBackups(
+                backups.distinctBy { it.path }
+                    .sortedByDescending { it.modifiedEpochSeconds }
+                    .take(MAX_BACKUPS),
+            )
+        }
     }
 
     suspend fun setBackgroundOperation(record: BackgroundOperationRecord?) {
@@ -295,18 +329,64 @@ class AppPreferences(private val context: Context) {
         commandTags = decodeCommandTags(preferences[Keys.commandTags]),
         terminalShortcuts = decodeTerminalShortcuts(preferences[Keys.terminalShortcuts]),
         firstDiscoveryCompleted = preferences[Keys.firstDiscoveryCompleted] ?: false,
-        externalAppsConfigured = preferences[Keys.externalAppsConfigured] ?: false,
         dynamicColors = preferences[Keys.dynamicColors] ?: true,
-        hideMaintenanceFromRecents =
-            preferences[Keys.hideMaintenanceFromRecents] ?: true,
-        termuxBackgroundProtection =
-            preferences[Keys.termuxBackgroundProtection] ?: true,
-        termuxWakeLockAlwaysOn =
-            preferences[Keys.termuxWakeLockAlwaysOn] ?: false,
-        termuxBackgroundProtectionActive =
-            preferences[Keys.termuxBackgroundProtectionActive] ?: false,
+        hideFromRecentsWhenBackground =
+            preferences[Keys.hideFromRecentsWhenBackground] ?: true,
+        autoStartBackendReady = preferences[Keys.autoStartBackendReady] ?: false,
+        autoStartEnabled = preferences[Keys.autoStartEnabled] ?: false,
+        autoStartNames = preferences[Keys.autoStartNames].orEmpty(),
+        backupRetentionCount =
+            preferences[Keys.backupRetentionCount]?.takeIf { it in 2..10 } ?: 0,
+        backups = decodeBackups(preferences[Keys.backups]),
         backgroundOperation = decodeBackgroundOperation(preferences[Keys.backgroundOperation]),
     )
+
+    private fun encodeBackups(backups: List<BackupEntry>): String =
+        backups.joinToString("\n") { backup ->
+            listOf(
+                encodeText(backup.fileName),
+                encodeText(backup.path),
+                encodeText(backup.instanceName),
+                backup.sizeBytes.toString(),
+                backup.modifiedEpochSeconds.toString(),
+                if (backup.checksumPresent) "1" else "0",
+                encodeText(backup.displayName),
+                backup.logicalSizeBytes.toString(),
+                if (backup.metadataPresent) "1" else "0",
+            ).joinToString("|")
+        }
+
+    private fun decodeBackups(raw: String?): List<BackupEntry> =
+        raw.orEmpty().lineSequence().mapNotNull { line ->
+            val columns = line.split('|', limit = 9)
+            if (columns.size != 9) return@mapNotNull null
+            val fileName = decodeText(columns[0])?.takeIf {
+                BACKUP_FILE_REGEX.matches(it)
+            } ?: return@mapNotNull null
+            val path = decodeText(columns[1])?.takeIf {
+                it == "/data/local/cntermux/backups/$fileName"
+            } ?: return@mapNotNull null
+            val instanceName = decodeText(columns[2])?.takeIf {
+                INSTANCE_NAME_REGEX.matches(it)
+            } ?: return@mapNotNull null
+            val displayName = decodeText(columns[6])?.trim()?.takeIf {
+                it.isNotEmpty() && it.length <= MAX_BACKUP_DISPLAY_NAME_LENGTH
+            } ?: instanceName
+            BackupEntry(
+                fileName = fileName,
+                path = path,
+                instanceName = instanceName,
+                sizeBytes = columns[3].toLongOrNull()?.coerceAtLeast(0) ?: 0,
+                modifiedEpochSeconds = columns[4].toLongOrNull()?.coerceAtLeast(0) ?: 0,
+                checksumPresent = columns[5] == "1",
+                displayName = displayName,
+                logicalSizeBytes = columns[7].toLongOrNull()?.coerceAtLeast(0) ?: 0,
+                metadataPresent = columns[8] == "1",
+            )
+        }.distinctBy { it.path }
+            .sortedByDescending { it.modifiedEpochSeconds }
+            .take(MAX_BACKUPS)
+            .toList()
 
     private fun encodeBackgroundOperation(record: BackgroundOperationRecord): String =
         listOf(
@@ -408,30 +488,63 @@ class AppPreferences(private val context: Context) {
             listOf(
                 command.id,
                 encodeText(command.title),
+                command.type.name,
                 encodeText(command.script),
+                command.keyStroke?.key.orEmpty(),
+                if (command.keyStroke?.ctrl == true) "1" else "0",
+                if (command.keyStroke?.alt == true) "1" else "0",
+                if (command.keyStroke?.shift == true) "1" else "0",
                 command.tagIds.sorted().joinToString(","),
+                if (command.confirmBeforeRun) "1" else "0",
             ).joinToString("|")
         }
 
     private fun decodeCommands(raw: String?): List<UserCommand> =
         raw.orEmpty().lineSequence().mapNotNull { line ->
-            val columns = line.split('|', limit = 4)
-            if (columns.size != 4 || !COMMAND_ID_REGEX.matches(columns[0])) {
+            val columns = line.split('|')
+            if (columns.size !in setOf(4, 9, 10) || !COMMAND_ID_REGEX.matches(columns[0])) {
                 return@mapNotNull null
             }
             val title = decodeText(columns[1])?.takeIf(String::isNotBlank)
                 ?: return@mapNotNull null
-            val script = decodeText(columns[2])?.takeIf(String::isNotBlank)
+            if (columns.size == 4) {
+                val script = decodeText(columns[2])?.takeIf(String::isNotBlank)
+                    ?: return@mapNotNull null
+                return@mapNotNull UserCommand(
+                    id = columns[0],
+                    title = title,
+                    script = script,
+                    tagIds = decodeCommandTagIds(columns[3]),
+                )
+            }
+            val type = runCatching { UserCommandType.valueOf(columns[2]) }.getOrNull()
                 ?: return@mapNotNull null
+            val script = decodeText(columns[3]) ?: return@mapNotNull null
+            val keyStroke = if (type == UserCommandType.KEY) {
+                TerminalKeyStroke(
+                    key = columns[4],
+                    ctrl = columns[5] == "1",
+                    alt = columns[6] == "1",
+                    shift = columns[7] == "1",
+                ).takeIf(TerminalKeys::isValid) ?: return@mapNotNull null
+            } else {
+                null
+            }
+            if (type == UserCommandType.COMMAND && script.isBlank()) return@mapNotNull null
             UserCommand(
                 id = columns[0],
                 title = title,
                 script = script,
-                tagIds = columns[3].split(',')
-                    .filter(COMMAND_TAG_ID_REGEX::matches)
-                    .toSet(),
+                tagIds = decodeCommandTagIds(columns[8]),
+                type = type,
+                keyStroke = keyStroke,
+                confirmBeforeRun = columns.getOrNull(9) == "1",
             )
         }.take(MAX_COMMANDS).toList()
+
+    private fun decodeCommandTagIds(raw: String): Set<String> = raw.split(',')
+        .filter(COMMAND_TAG_ID_REGEX::matches)
+        .toSet()
 
     private fun encodeTerminalShortcuts(
         shortcuts: List<TerminalShortcutPreference>,
@@ -508,6 +621,8 @@ class AppPreferences(private val context: Context) {
         private const val MAX_TERMINAL_SHORTCUTS = 32
         private const val MAX_SHORTCUT_LABEL_LENGTH = 12
         private const val MAX_SHORTCUT_TEXT_LENGTH = 4096
+        private const val MAX_BACKUPS = 200
+        private const val MAX_BACKUP_DISPLAY_NAME_LENGTH = 60
         private val LEGACY_DEFAULT_TAGS = setOf(
             "tools" to "工具",
             "system" to "系统",
@@ -515,5 +630,8 @@ class AppPreferences(private val context: Context) {
         )
         private val COMMAND_TAG_ID_REGEX = Regex("[A-Za-z0-9_-]{1,48}")
         private val COMMAND_ID_REGEX = Regex("[A-Za-z0-9_-]{1,64}")
+        private val INSTANCE_NAME_REGEX = Regex("[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+        private val BACKUP_FILE_REGEX =
+            Regex("[A-Za-z0-9][A-Za-z0-9_-]{0,31}_[0-9]{8}_[0-9]{6}\\.img\\.sparse")
     }
 }

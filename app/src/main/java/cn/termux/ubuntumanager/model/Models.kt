@@ -16,10 +16,26 @@ data class UbuntuInstance(
     val isManaged: Boolean,
     val sshPort: Int,
     val hasLocalSession: Boolean = false,
+    val localSessionPort: Int? = null,
     val hostAddress: String? = null,
     val state: InstanceRuntimeState = InstanceRuntimeState.CHECKING,
     val uptime: String? = null,
     val message: String? = null,
+    val savedRootPassword: String? = null,
+    val savedRootPasswordUpdatedAt: Long? = null,
+    val autoStartEnabled: Boolean = false,
+)
+
+enum class UserCommandType {
+    COMMAND,
+    KEY,
+}
+
+data class TerminalKeyStroke(
+    val key: String,
+    val ctrl: Boolean = false,
+    val alt: Boolean = false,
+    val shift: Boolean = false,
 )
 
 data class UserCommand(
@@ -27,6 +43,9 @@ data class UserCommand(
     val title: String,
     val script: String,
     val tagIds: Set<String> = emptySet(),
+    val type: UserCommandType = UserCommandType.COMMAND,
+    val keyStroke: TerminalKeyStroke? = null,
+    val confirmBeforeRun: Boolean = false,
 )
 
 data class CommandTag(
@@ -63,28 +82,17 @@ data class CommandHistoryEntry(
 
 data class EnvironmentStatus(
     val checking: Boolean = true,
-    val termuxInstalled: Boolean = false,
-    val termuxVersion: String? = null,
-    val termuxStopped: Boolean = false,
-    val permissionGranted: Boolean = false,
-    val externalAppsConfigured: Boolean = false,
-    val connectionAvailable: Boolean = false,
-    val prootVersion: String? = null,
-    val prootCompatible: Boolean = false,
-    val storageReady: Boolean = false,
-    val termuxReadStorageGranted: Boolean = false,
-    val termuxWriteStorageGranted: Boolean = false,
-    val termuxAllFilesGranted: Boolean = false,
-    val storageDirectoryPresent: Boolean = false,
-    val storageLinksPresent: Boolean = false,
-    val storageWriteTestPassed: Boolean = false,
+    val alphaInstalled: Boolean = false,
+    val alphaVersion: String? = null,
+    val rootGranted: Boolean = false,
+    val backendReady: Boolean = false,
+    val backendVersion: String? = null,
+    val backupReady: Boolean = false,
+    val autoStartReady: Boolean = false,
     val error: String? = null,
 ) {
     val ready: Boolean
-        get() = termuxInstalled &&
-            permissionGranted &&
-            connectionAvailable &&
-            prootCompatible
+        get() = alphaInstalled && rootGranted && backendReady
 }
 
 data class StorageProbe(
@@ -100,6 +108,9 @@ data class BackupEntry(
     val sizeBytes: Long,
     val modifiedEpochSeconds: Long,
     val checksumPresent: Boolean,
+    val displayName: String = instanceName,
+    val logicalSizeBytes: Long = 0,
+    val metadataPresent: Boolean = false,
 )
 
 data class OperationInfo(
@@ -141,30 +152,21 @@ data class OperationOutcome(
     val message: String,
 )
 
-enum class TermuxWakeLockState {
-    DISABLED,
-    IDLE,
-    ACQUIRING,
-    HELD,
-    RELEASING,
-    ERROR,
-}
-
 data class AppUiState(
     val environment: EnvironmentStatus = EnvironmentStatus(),
     val instances: List<UbuntuInstance> = emptyList(),
     val backups: List<BackupEntry> = emptyList(),
+    val backupsSyncing: Boolean = false,
+    val backupsVerified: Boolean = false,
     val commandHistory: List<CommandHistoryEntry> = emptyList(),
     val commands: List<UserCommand> = emptyList(),
     val commandTags: List<CommandTag> = emptyList(),
     val terminalShortcuts: List<TerminalShortcutPreference> = emptyList(),
     val currentOperation: OperationInfo? = null,
     val backgroundOperation: BackgroundOperationRecord? = null,
-    val hideMaintenanceFromRecents: Boolean = true,
-    val termuxBackgroundProtection: Boolean = true,
-    val termuxWakeLockAlwaysOn: Boolean = false,
-    val termuxWakeLockState: TermuxWakeLockState = TermuxWakeLockState.IDLE,
-    val termuxWakeLockMessage: String? = null,
+    val hideFromRecentsWhenBackground: Boolean = true,
+    val autoStartEnabled: Boolean = false,
+    val backupRetentionCount: Int = 0,
     val lastMessage: String? = null,
     val lastStatusCheckEpochMillis: Long? = null,
 )
@@ -188,7 +190,7 @@ data class CommandResult(
             .ifBlank { "命令执行失败（退出码 $exitCode）" }
 }
 
-data class ProotSession(
+data class ChrootSession(
     val pid: Int,
     val container: String,
     val type: String,

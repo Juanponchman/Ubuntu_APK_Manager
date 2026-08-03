@@ -29,8 +29,8 @@ class BackgroundOperationRequestTest {
     @Test
     fun restoreRequestKeepsValidatedBackupIdentity() {
         val backup = BackupEntry(
-            fileName = "ubuntu_20260731_120000.tar.xz",
-            path = "/safe/ubuntu_20260731_120000.tar.xz",
+            fileName = "ubuntu_20260731_120000.img.sparse",
+            path = "/safe/ubuntu_20260731_120000.img.sparse",
             instanceName = "ubuntu",
             sizeBytes = 42,
             modifiedEpochSeconds = 10,
@@ -42,5 +42,14 @@ class BackgroundOperationRequestTest {
         assertEquals(backup, first.backup)
         assertEquals(BackgroundOperationType.RESTORE, first.type)
         assertNotEquals(first.id, second.id)
+    }
+
+    @Test
+    fun backupRequestKeepsUserVisibleName() {
+        val request = BackgroundOperationRequest.backup("ubuntu", "升级 Node 之前")
+
+        assertEquals(BackgroundOperationType.BACKUP, request.type)
+        assertEquals("ubuntu", request.instanceName)
+        assertEquals("升级 Node 之前", request.secondaryName)
     }
 }

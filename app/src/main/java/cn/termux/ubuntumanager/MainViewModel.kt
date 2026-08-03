@@ -11,7 +11,6 @@ import cn.termux.ubuntumanager.model.TerminalShortcutPreference
 import cn.termux.ubuntumanager.model.UserCommand
 import cn.termux.ubuntumanager.operation.BackgroundOperationRequest
 import cn.termux.ubuntumanager.operation.OperationForegroundService
-import cn.termux.ubuntumanager.operation.RecentTaskVisibility
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,10 +36,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _alphaSetupInProgress = MutableStateFlow(false)
     val alphaSetupInProgress = _alphaSetupInProgress.asStateFlow()
-    private val _storageRepairInProgress = MutableStateFlow(false)
-    val storageRepairInProgress = _storageRepairInProgress.asStateFlow()
-    private val _storageLinkInProgress = MutableStateFlow(false)
-    val storageLinkInProgress = _storageLinkInProgress.asStateFlow()
     private val _backgroundSetupInProgress = MutableStateFlow(false)
     val backgroundSetupInProgress = _backgroundSetupInProgress.asStateFlow()
     private val _localSessionState = MutableStateFlow(LocalSessionState())
@@ -55,7 +50,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             repository.reconcileBackgroundOperation(
                 OperationForegroundService.isOperationActive(),
             )
-            repository.refreshAll(allowConnectionProbe = false)
+            repository.loadCachedState()
         }
     }
 
@@ -68,7 +63,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         requestRefresh(
             allowConnectionProbe = true,
-            replaceActive = true,
+            replaceActive = false,
             showChecking = true,
         )
     }
@@ -78,53 +73,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startStatusMonitoring() {
-        val maintenanceActive = OperationForegroundService.isOperationActive() ||
-            repository.state.value.currentOperation != null
-        if (statusMonitoringJob?.isActive == true) {
-            if (!maintenanceActive) {
-                requestRefresh(
-                    allowConnectionProbe = true,
-                    replaceActive = false,
-                    showChecking = false,
-                )
-            }
-            return
-        }
-        if (!maintenanceActive) {
-            requestRefresh(
-                allowConnectionProbe = true,
-                replaceActive = true,
-                showChecking = true,
-            )
-        }
+        if (statusMonitoringJob?.isActive == true) return
         statusMonitoringJob = viewModelScope.launch {
-            var failedConnectionAttempts = 0
             while (isActive) {
-                val environment = repository.state.value.environment
-                val retryDelay = if (environment.connectionAvailable) {
-                    STATUS_REFRESH_INTERVAL_MILLIS
-                } else {
-                    ReconnectBackoff.delayMillis(failedConnectionAttempts)
-                }
-                delay(retryDelay)
+                delay(STATUS_REFRESH_INTERVAL_MILLIS)
                 if (repository.state.value.currentOperation != null) continue
 
                 if (repository.state.value.environment.ready) {
                     repository.refreshRuntime()
-                } else if (!repository.state.value.environment.connectionAvailable) {
-                    requestRefresh(
-                        allowConnectionProbe = true,
-                        replaceActive = false,
-                        showChecking = false,
-                    ).join()
                 }
-
-                failedConnectionAttempts =
-                    if (repository.state.value.environment.connectionAvailable) {
-                        0
-                    } else {
-                        failedConnectionAttempts + 1
-                    }
             }
         }
     }
@@ -166,10 +123,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun restart(name: String) {
-        viewModelScope.launch {
-            repository.stop(name)
-            repository.start(name)
-        }
+        viewModelScope.launch { repository.restartSsh(name) }
     }
 
     fun create(
@@ -275,8 +229,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.setProtection(name, protected) }
     }
 
+    fun setAutoStartEnabled(enabled: Boolean) {
+        viewModelScope.launch { repository.setAutoStartEnabled(enabled) }
+    }
+
+    fun setInstanceAutoStart(name: String, enabled: Boolean) {
+        viewModelScope.launch { repository.setInstanceAutoStart(name, enabled) }
+    }
+
     fun updateSshPort(name: String, port: Int) {
         viewModelScope.launch { repository.updateSshPort(name, port) }
+    }
+
+    fun updateRootPassword(name: String, password: String) {
+        viewModelScope.launch { repository.updateRootPassword(name, password) }
+    }
+
+    fun clearSavedRootPassword(name: String) {
+        viewModelScope.launch { repository.clearSavedRootPassword(name) }
     }
 
     fun rename(name: String, newName: String) {
@@ -355,8 +325,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         enqueueBackgroundOperation(BackgroundOperationRequest.deleteInstance(name))
     }
 
-    fun backup(name: String) {
-        enqueueBackgroundOperation(BackgroundOperationRequest.backup(name))
+    fun backup(name: String, displayName: String) {
+        enqueueBackgroundOperation(BackgroundOperationRequest.backup(name, displayName))
     }
 
     fun restore(backup: BackupEntry) {
@@ -367,15 +337,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.deleteBackup(backup) }
     }
 
+    fun renameBackup(backup: BackupEntry, displayName: String) {
+        viewModelScope.launch { repository.renameBackup(backup, displayName) }
+    }
+
+    fun syncBackups() {
+        viewModelScope.launch { repository.syncBackups() }
+    }
+
     fun loadLogs(name: String) {
         _logContent.value = "正在读取日志…"
         viewModelScope.launch {
             _logContent.value = repository.logs(name)
         }
-    }
-
-    fun openTermux() {
-        repository.openTermux()
     }
 
     fun clearMessage() {
@@ -388,7 +362,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _alphaSetupInProgress.value = true
             var configured = false
             val message = try {
-                app.rootPermissionSetup.configure().also { configured = true }
+                val result = app.chrootClient.bootstrap(force = true)
+                check(result.isSuccess) { result.bestError }
+                configured = true
+                "Magisk Alpha 授权完成，Root Chroot 后端已安装"
             } catch (error: Exception) {
                 "Magisk Alpha 配置失败：${error.message ?: error::class.java.simpleName}"
             } finally {
@@ -401,74 +378,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun repairStorageWithAlpha() {
-        if (_storageRepairInProgress.value) return
-        viewModelScope.launch {
-            _storageRepairInProgress.value = true
-            var repaired = false
-            val message = try {
-                app.rootPermissionSetup
-                    .repairTermuxStoragePermissions()
-                    .also { repaired = true }
-            } catch (error: Exception) {
-                "Magisk Alpha 存储修复失败：${error.message ?: error::class.java.simpleName}"
-            } finally {
-                _storageRepairInProgress.value = false
-            }
-            repository.showMessage(message)
-            if (repaired) {
-                repository.refreshAll(allowConnectionProbe = true)
-            }
-        }
-    }
-
-    fun createStorageLinksWithAlpha(rebuild: Boolean) {
-        if (_storageLinkInProgress.value) return
-        viewModelScope.launch {
-            _storageLinkInProgress.value = true
-            var linksCreated = false
-            val message = try {
-                app.rootPermissionSetup
-                    .createTermuxStorageLinks(rebuild)
-                    .also { linksCreated = true }
-            } catch (error: Exception) {
-                "Magisk Alpha 目录链接操作失败：" +
-                    (error.message ?: error::class.java.simpleName)
-            } finally {
-                _storageLinkInProgress.value = false
-            }
-            repository.showMessage(message)
-            if (linksCreated) {
-                repository.verifyStorageLinksAndPrepareBackupDirectory()
-            } else {
-                repository.refreshAll(allowConnectionProbe = true)
-            }
-        }
-    }
-
     fun setDynamicColors(enabled: Boolean) {
         viewModelScope.launch { repository.setDynamicColors(enabled) }
     }
 
-    fun setHideMaintenanceFromRecents(enabled: Boolean) {
+    fun setHideFromRecentsWhenBackground(enabled: Boolean) {
         viewModelScope.launch {
-            repository.setHideMaintenanceFromRecents(enabled)
-            RecentTaskVisibility.setExcluded(
-                getApplication(),
-                enabled && OperationForegroundService.isOperationActive(),
-            )
+            repository.setHideFromRecentsWhenBackground(enabled)
         }
     }
 
-    fun setTermuxBackgroundProtection(enabled: Boolean) {
+    fun setBackupRetentionCount(count: Int) {
         viewModelScope.launch {
-            repository.setTermuxBackgroundProtection(enabled)
-        }
-    }
-
-    fun setTermuxWakeLockAlwaysOn(enabled: Boolean) {
-        viewModelScope.launch {
-            repository.setTermuxWakeLockAlwaysOn(enabled)
+            try {
+                repository.setBackupRetentionCount(count)
+            } catch (error: Exception) {
+                repository.showMessage(
+                    "保存备份保留策略失败：${error.message ?: error::class.java.simpleName}",
+                )
+            }
         }
     }
 
