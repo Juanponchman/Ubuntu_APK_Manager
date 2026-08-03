@@ -40,6 +40,7 @@ data class BackgroundOperationRequest(
                 target.putExtra(EXTRA_BACKUP_DISPLAY_NAME, entry.displayName)
                 target.putExtra(EXTRA_BACKUP_LOGICAL_SIZE, entry.logicalSizeBytes)
                 target.putExtra(EXTRA_BACKUP_METADATA, entry.metadataPresent)
+                target.putExtra(EXTRA_BACKUP_PORTABLE, entry.portableArchive)
             }
         }
 
@@ -63,6 +64,7 @@ data class BackgroundOperationRequest(
         private const val EXTRA_BACKUP_DISPLAY_NAME = "background_operation_backup_display_name"
         private const val EXTRA_BACKUP_LOGICAL_SIZE = "background_operation_backup_logical_size"
         private const val EXTRA_BACKUP_METADATA = "background_operation_backup_metadata"
+        private const val EXTRA_BACKUP_PORTABLE = "background_operation_backup_portable"
 
         private val ID_PATTERN = Regex("[A-Za-z0-9_-]{1,64}")
 
@@ -87,6 +89,7 @@ data class BackgroundOperationRequest(
                         ?: intent.getStringExtra(EXTRA_BACKUP_INSTANCE) ?: return null,
                     logicalSizeBytes = intent.getLongExtra(EXTRA_BACKUP_LOGICAL_SIZE, 0),
                     metadataPresent = intent.getBooleanExtra(EXTRA_BACKUP_METADATA, false),
+                    portableArchive = intent.getBooleanExtra(EXTRA_BACKUP_PORTABLE, false),
                 )
             }
             return BackgroundOperationRequest(

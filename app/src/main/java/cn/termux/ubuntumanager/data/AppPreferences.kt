@@ -353,18 +353,25 @@ class AppPreferences(private val context: Context) {
                 encodeText(backup.displayName),
                 backup.logicalSizeBytes.toString(),
                 if (backup.metadataPresent) "1" else "0",
+                if (backup.portableArchive) "1" else "0",
             ).joinToString("|")
         }
 
     private fun decodeBackups(raw: String?): List<BackupEntry> =
         raw.orEmpty().lineSequence().mapNotNull { line ->
-            val columns = line.split('|', limit = 9)
-            if (columns.size != 9) return@mapNotNull null
+            val columns = line.split('|', limit = 10)
+            if (columns.size !in setOf(9, 10)) return@mapNotNull null
             val fileName = decodeText(columns[0])?.takeIf {
                 BACKUP_FILE_REGEX.matches(it)
             } ?: return@mapNotNull null
+            val portableArchive = columns.getOrNull(9) == "1"
+            val expectedDirectory = if (portableArchive) {
+                "/storage/emulated/0/Ubuntu管理器/备份"
+            } else {
+                "/data/local/cntermux/backups"
+            }
             val path = decodeText(columns[1])?.takeIf {
-                it == "/data/local/cntermux/backups/$fileName"
+                it == "$expectedDirectory/$fileName"
             } ?: return@mapNotNull null
             val instanceName = decodeText(columns[2])?.takeIf {
                 INSTANCE_NAME_REGEX.matches(it)
@@ -382,6 +389,7 @@ class AppPreferences(private val context: Context) {
                 displayName = displayName,
                 logicalSizeBytes = columns[7].toLongOrNull()?.coerceAtLeast(0) ?: 0,
                 metadataPresent = columns[8] == "1",
+                portableArchive = portableArchive,
             )
         }.distinctBy { it.path }
             .sortedByDescending { it.modifiedEpochSeconds }
@@ -632,6 +640,10 @@ class AppPreferences(private val context: Context) {
         private val COMMAND_ID_REGEX = Regex("[A-Za-z0-9_-]{1,64}")
         private val INSTANCE_NAME_REGEX = Regex("[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
         private val BACKUP_FILE_REGEX =
-            Regex("[A-Za-z0-9][A-Za-z0-9_-]{0,31}_[0-9]{8}_[0-9]{6}\\.img\\.sparse")
+            Regex(
+                "(?:[A-Za-z0-9][A-Za-z0-9_-]{0,31}_[0-9]{8}_[0-9]{6}\\.img\\.sparse)|" +
+                    "(?:[A-Za-z0-9][A-Za-z0-9_-]{0,31}--[0-9]{8}_[0-9]{6}--" +
+                    "[\\p{L}\\p{N}._ -]{1,32}\\.cnubuntu)",
+            )
     }
 }

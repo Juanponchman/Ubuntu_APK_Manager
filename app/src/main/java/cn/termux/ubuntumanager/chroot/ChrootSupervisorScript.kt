@@ -77,8 +77,8 @@ internal object ChrootSupervisorScript {
           pid="${'$'}(/system/bin/head -n 1 "${'$'}pidfile" 2>/dev/null)"
           case "${'$'}pid" in ''|*[!0-9]*) return 1 ;; esac
           kill -0 "${'$'}pid" 2>/dev/null || return 1
-          cmd="${'$'}(/system/bin/tr '\000' ' ' < "/proc/${'$'}pid/cmdline" 2>/dev/null)"
-          case "${'$'}cmd" in *"chroot-supervisor.sh run ${'$'}name "*) return 0 ;; *) return 1 ;; esac
+          process_cmd="${'$'}(/system/bin/tr '\000' ' ' < "/proc/${'$'}pid/cmdline" 2>/dev/null)"
+          case "${'$'}process_cmd" in *"chroot-supervisor.sh run ${'$'}name "*) return 0 ;; *) return 1 ;; esac
         }
 
         run_instance() {
@@ -107,6 +107,7 @@ internal object ChrootSupervisorScript {
           trap shutdown_instance HUP INT TERM
           /system/bin/chroot "${'$'}root" /usr/bin/env -i \
             HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TERM=xterm-256color \
+            LANG=C.UTF-8 LC_ALL=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=/tmp \
             /bin/bash -lc "mkdir -p /run/sshd; exec /usr/sbin/sshd -D -e -p ${'$'}port" \
             >> "${'$'}LOGS/${'$'}name.log" 2>&1 &
@@ -176,6 +177,7 @@ internal object ChrootSupervisorScript {
           /system/bin/chmod 700 "${'$'}root${'$'}cmd"
           /system/bin/chroot "${'$'}root" /usr/bin/env -i \
             HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TERM=xterm-256color \
+            LANG=C.UTF-8 LC_ALL=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=/tmp \
             /bin/bash "${'$'}cmd"
           result="${'$'}?"
@@ -190,19 +192,43 @@ internal object ChrootSupervisorScript {
             /system/bin/unshare -m /system/bin/sh "${'$'}HELPER" oneshot "${'$'}name" "${'$'}encoded"
             return "${'$'}?"
           fi
-          pid="${'$'}(/system/bin/head -n 1 "${'$'}(pid_for "${'$'}name")")"
           root="${'$'}(root_for "${'$'}name")"
           cmd="/run/cntermux-command-${'$'}${'$'}.sh"
-          /system/bin/nsenter -t "${'$'}pid" -m -- /system/bin/sh -c \
-            "/system/bin/printf '%s' '${'$'}encoded' | /system/bin/base64 -d > '${'$'}root${'$'}cmd' && /system/bin/chmod 700 '${'$'}root${'$'}cmd'" \
-            || fail 'cannot decode command'
-          /system/bin/nsenter -t "${'$'}pid" -m -- /system/bin/chroot "${'$'}root" /usr/bin/env -i \
-            HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TERM=xterm-256color \
-            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=/tmp \
-            /bin/bash "${'$'}cmd"
-          result="${'$'}?"
-          /system/bin/nsenter -t "${'$'}pid" -m -- /system/bin/rm -f "${'$'}root${'$'}cmd" 2>/dev/null || true
-          return "${'$'}result"
+          attempt=0
+          while [ "${'$'}attempt" -lt 2 ]; do
+            is_running "${'$'}name" || fail 'instance stopped while preparing command'
+            pid="${'$'}(/system/bin/head -n 1 "${'$'}(pid_for "${'$'}name")")"
+            marker="${'$'}(run_for "${'$'}name")/exec-entered-${'$'}${'$'}-${'$'}attempt"
+            /system/bin/rm -f "${'$'}marker"
+            /system/bin/nsenter -t "${'$'}pid" -m -- /system/bin/sh -c '
+              root="${'$'}1"
+              cmd="${'$'}2"
+              encoded="${'$'}3"
+              marker="${'$'}4"
+              target="${'$'}{root}${'$'}{cmd}"
+              [ -d "${'$'}root/run" ] || exit 125
+              cleanup() { /system/bin/rm -f "${'$'}target"; }
+              trap cleanup EXIT
+              /system/bin/printf "%s" "${'$'}encoded" | /system/bin/base64 -d > "${'$'}target" || exit 125
+              /system/bin/chmod 700 "${'$'}target" || exit 125
+              /system/bin/printf "entered\n" > "${'$'}marker" || exit 125
+              /system/bin/chroot "${'$'}root" /usr/bin/env -i \
+                HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TERM=xterm-256color \
+                LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+                PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=/tmp \
+                /bin/bash "${'$'}cmd"
+              exit "${'$'}?"
+            ' cntermux "${'$'}root" "${'$'}cmd" "${'$'}encoded" "${'$'}marker"
+            result="${'$'}?"
+            if [ -f "${'$'}marker" ]; then
+              /system/bin/rm -f "${'$'}marker"
+              return "${'$'}result"
+            fi
+            /system/bin/rm -f "${'$'}marker"
+            attempt="${'$'}((attempt + 1))"
+            /system/bin/sleep 0.1
+          done
+          fail 'instance mount namespace changed during command setup'
         }
 
         install_instance() {
@@ -224,12 +250,14 @@ internal object ChrootSupervisorScript {
           /system/bin/printf '127.0.0.1 localhost\n127.0.1.1 %s\n' "${'$'}name" > "${'$'}root/etc/hosts"
           /system/bin/chroot "${'$'}root" /usr/bin/env -i \
             HOME=/root USER=root LOGNAME=root SHELL=/bin/bash DEBIAN_FRONTEND=noninteractive TMPDIR=/tmp \
+            LANG=C.UTF-8 LC_ALL=C.UTF-8 \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             /bin/bash -lc "apt-get update && apt-get install -y --no-install-recommends openssh-server tmux ttyd nmap iproute2 procps ca-certificates zstd && apt-get clean"
           result="${'$'}?"
           if [ "${'$'}result" -eq 0 ]; then
             /system/bin/chroot "${'$'}root" /usr/bin/env -i \
               HOME=/root USER=root LOGNAME=root SHELL=/bin/bash TMPDIR=/tmp \
+              LANG=C.UTF-8 LC_ALL=C.UTF-8 \
               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
               /bin/bash -lc "printf 'root:${ChrootContract.DEFAULT_ROOT_PASSWORD}\\n' | /usr/sbin/chpasswd; /usr/bin/ssh-keygen -A; /usr/bin/mkdir -p /run/sshd; printf 'PermitRootLogin yes\\nPasswordAuthentication yes\\nKbdInteractiveAuthentication no\\nUsePAM no\\n' > /etc/ssh/sshd_config.d/99-cntermux.conf; /usr/bin/chmod 600 /etc/ssh/sshd_config.d/99-cntermux.conf"
             result="${'$'}?"

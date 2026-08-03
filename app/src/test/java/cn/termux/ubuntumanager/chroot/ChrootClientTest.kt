@@ -37,7 +37,20 @@ class ChrootClientTest {
         assertTrue(script.contains("mount none / -o rprivate"))
         assertTrue(script.contains("--kill-rooted"))
         assertTrue(script.contains(ChrootContract.SPARSE_COPY_PATH))
+        assertTrue(script.contains("exec-entered-"))
+        assertTrue(script.contains("instance mount namespace changed"))
+        assertTrue(script.contains("process_cmd="))
+        assertTrue(script.contains("LANG=C.UTF-8 LC_ALL=C.UTF-8"))
         assertFalse(script.contains("proot-distro"))
+    }
+
+    @Test
+    fun supervisorScriptHasValidPosixShellSyntax() {
+        val process = ProcessBuilder("/bin/sh", "-n").start()
+        process.outputStream.bufferedWriter().use { it.write(ChrootSupervisorScript.content) }
+        val stderr = process.errorStream.bufferedReader().readText()
+
+        assertEquals(stderr, 0, process.waitFor())
     }
 
     @Test
@@ -167,5 +180,23 @@ class ChrootClientTest {
         assertEquals(displayName, backup.displayName)
         assertEquals(8589934592L, backup.logicalSizeBytes)
         assertTrue(backup.metadataPresent)
+    }
+
+    @Test
+    fun parsesPortableVisibleBackup() {
+        val backup = ChrootClient.parseBackupSnapshot(
+            sequenceOf(
+                "ubuntu--20260803_120000--Code 环境.cnubuntu|512000|8589934592|300|1|Q29kZSDnjq_looM",
+            ),
+        ).single()
+
+        assertEquals("Code 环境", backup.displayName)
+        assertEquals("ubuntu", backup.instanceName)
+        assertEquals(
+            "/storage/emulated/0/Ubuntu管理器/备份/${backup.fileName}",
+            backup.path,
+        )
+        assertTrue(backup.portableArchive)
+        assertTrue(backup.checksumPresent)
     }
 }

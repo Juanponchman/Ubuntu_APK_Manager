@@ -75,9 +75,12 @@ class ChrootClient(
         }
         val helperInstall = root.execute(
             "set -e; /system/bin/mkdir -p /data/adb/cntermux; " +
-                "/system/bin/cat > '${ChrootContract.HELPER_PATH}'; " +
-                "/system/bin/chmod 700 '${ChrootContract.HELPER_PATH}'; " +
-                "/system/bin/chcon u:object_r:magisk_file:s0 '${ChrootContract.HELPER_PATH}' 2>/dev/null || true; " +
+                "/system/bin/cat > '${ChrootContract.HELPER_PATH}.tmp'; " +
+                "/system/bin/chmod 700 '${ChrootContract.HELPER_PATH}.tmp'; " +
+                "/system/bin/chcon u:object_r:magisk_file:s0 " +
+                "'${ChrootContract.HELPER_PATH}.tmp' 2>/dev/null || true; " +
+                "/system/bin/mv -f '${ChrootContract.HELPER_PATH}.tmp' " +
+                "'${ChrootContract.HELPER_PATH}'; " +
                 "'${ChrootContract.HELPER_PATH}' bootstrap",
             20_000,
             ByteArrayInputStream(ChrootSupervisorScript.content.toByteArray()),
@@ -129,14 +132,23 @@ class ChrootClient(
         val ready = bootstrap()
         if (!ready.isSuccess) return StorageProbe(false, false, false)
         val result = root.execute(
-            "test -d '${ChrootContract.BACKUP_DIRECTORY}' && " +
-                "test -w '${ChrootContract.BACKUP_DIRECTORY}'",
+            "test -d '/storage/emulated/0' && test -w '/storage/emulated/0' && " +
+                "test -d '${ChrootContract.CACHE_DIRECTORY}' && " +
+                "test -w '${ChrootContract.CACHE_DIRECTORY}'",
             timeoutMillis,
         )
         return StorageProbe(true, true, result.isSuccess)
     }
 
-    suspend fun prepareBackupDirectory(): CommandResult = bootstrap()
+    suspend fun prepareBackupDirectory(): CommandResult {
+        val ready = bootstrap()
+        if (!ready.isSuccess) return ready
+        return root.execute(
+            "/system/bin/mkdir -p '${ChrootContract.PORTABLE_BACKUP_DIRECTORY}' && " +
+                "test -w '${ChrootContract.PORTABLE_BACKUP_DIRECTORY}'",
+            20_000,
+        )
+    }
 
     /**
      * Performs the complete read-only environment refresh through one Alpha su process.
@@ -153,8 +165,9 @@ class ChrootClient(
                 "if [ \"\${backend}\" != 'CHROOT_BACKEND_${ChrootContract.VERSION}' ] || " +
                 "[ \"\${native}\" != '${ChrootContract.SPARSE_COPY_VERSION}' ] || " +
                 "[ \"\${autostart}\" != '${ChrootContract.AUTO_START_VERSION}' ]; then exit 0; fi; " +
-                "backup=0; [ -d '${ChrootContract.BACKUP_DIRECTORY}' ] && " +
-                "[ -w '${ChrootContract.BACKUP_DIRECTORY}' ] && backup=1; " +
+                "backup=0; [ -d '/storage/emulated/0' ] && [ -w '/storage/emulated/0' ] && " +
+                "[ -d '${ChrootContract.CACHE_DIRECTORY}' ] && " +
+                "[ -w '${ChrootContract.CACHE_DIRECTORY}' ] && backup=1; " +
                 "/system/bin/printf 'CNTERMUX_BACKUP|%s\\n' \"\${backup}\"; " +
                 autoStartSnapshotShell() +
                 runtimeSnapshotShell("CNTERMUX_RUNTIME|") +
@@ -388,7 +401,59 @@ class ChrootClient(
             LocalSessionBackend.UNKNOWN
         }
 
-    suspend fun hardenExistingLocalTerminal(name: String): CommandResult = success()
+    suspend fun captureLocalTerminalHistory(name: String): String {
+        requireValidName(name)
+        val result = executeScript(
+            name,
+            "tmux capture-pane -p -S - -t cntermux 2>/dev/null || true",
+        )
+        return if (result.isSuccess) result.stdout.trimEnd() else ""
+    }
+
+    suspend fun hardenExistingLocalTerminal(name: String): CommandResult {
+        requireValidName(name)
+        val port = root.execute(
+            "/system/bin/cat '${ChrootContract.RUNTIME_DIRECTORY}/$name/ttyd.port' 2>/dev/null",
+            5_000,
+        ).stdout.trim().toIntOrNull()?.takeIf { it in 1024..65535 }
+            ?: return failure("本地会话端口记录无效")
+        val compatibility = executeScript(
+            name,
+            "pid=\$(cat /run/cntermux/ttyd.pid 2>/dev/null || true); " +
+                "[ -n \"\${pid}\" ] || exit 1; " +
+                "tr '\\000' '\\n' < /proc/\${pid}/environ 2>/dev/null; " +
+                "printf '%s\\n' ---CMD---; " +
+                "tr '\\000' ' ' < /proc/\${pid}/cmdline 2>/dev/null",
+        )
+        if (
+            compatibility.isSuccess &&
+            compatibility.stdout.lineSequence().any { it == "LANG=C.UTF-8" } &&
+            (
+                compatibility.stdout.contains("rendererType=canvas") ||
+                    compatibility.stdout.contains("rendererType canvas")
+            ) &&
+            (
+                compatibility.stdout.contains("fontSize=10") ||
+                    compatibility.stdout.contains("fontSize 10")
+            ) &&
+            (
+                compatibility.stdout.contains("letterSpacing=0") ||
+                    compatibility.stdout.contains("letterSpacing 0")
+            ) &&
+            (
+                compatibility.stdout.contains("fontFamily=serif-monospace") ||
+                    compatibility.stdout.contains("fontFamily serif-monospace")
+            )
+        ) {
+            return success("ALREADY_COMPATIBLE")
+        }
+
+        val stopped = stopLocalTerminal(name, port)
+        if (!stopped.isSuccess) return stopped
+        val started = startLocalTerminal(name, port)
+        if (!started.isSuccess) return started
+        return waitForPortState(port, expectedOpen = true, timeoutMillis = 10_000)
+    }
 
     suspend fun startLocalTerminal(name: String, port: Int): CommandResult {
         requireValidName(name); requireValidPort(port)
@@ -399,7 +464,12 @@ class ChrootClient(
             if [ -f /run/cntermux/ttyd.pid ] && kill -0 "${'$'}(cat /run/cntermux/ttyd.pid)" 2>/dev/null; then
               exit 0
             fi
-            nohup setsid ttyd -W -i 127.0.0.1 -p $port tmux new-session -A -s cntermux \
+            nohup setsid ttyd -W -i 127.0.0.1 -p $port \
+              -t rendererType=canvas \
+              -t fontSize=10 \
+              -t letterSpacing=0 \
+              -t 'fontFamily=serif-monospace,Noto Sans CJK SC,sans-serif' \
+              tmux new-session -A -s cntermux \
               >/var/log/cntermux/ttyd.log 2>&1 </dev/null &
             printf '%s\n' "${'$'}!" >/run/cntermux/ttyd.pid
         """.trimIndent()
@@ -587,35 +657,57 @@ class ChrootClient(
         )
     }
 
-    suspend fun backup(name: String, displayName: String): String {
+    suspend fun backup(name: String, displayName: String): BackupEntry {
         requireValidName(name)
+        bootstrap().requireSuccess()
         val normalizedDisplayName = requireValidBackupDisplayName(displayName)
         val encodedDisplayName = Base64.encodeToString(
             normalizedDisplayName.toByteArray(Charsets.UTF_8),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
         )
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val file = "${name}_$timestamp.img.sparse"
-        val path = "${ChrootContract.BACKUP_DIRECTORY}/$file"
-        root.execute(
-            "set -e; src='${ChrootContract.IMAGE_DIRECTORY}/$name.img'; dst='$path'; [ -f \"\${src}\" ]; " +
-                "[ ! -e \"\${dst}\" ]; /system/bin/rm -f \"\${dst}.tmp\"; " +
-                "/system/bin/rm -f \"\${dst}.sha256.tmp\"; " +
-                "/system/bin/rm -f \"\${dst}.meta.json.tmp\"; " +
-                "logical=\$(/system/bin/stat -c %s \"\${src}\"); created=\$(/system/bin/date +%s); " +
-                "'${ChrootContract.SPARSE_COPY_PATH}' \"\${src}\" \"\${dst}.tmp\"; " +
-                "actual=\$(/system/bin/sha256sum \"\${dst}.tmp\" | /system/bin/cut -d' ' -f1); " +
-                "/system/bin/printf '%s  %s\\n' \"\${actual}\" '$file' > \"\${dst}.sha256.tmp\"; " +
-                "/system/bin/printf '{\"version\":1,\"displayNameBase64\":\"$encodedDisplayName\"," +
-                "\"instanceName\":\"$name\",\"logicalSizeBytes\":%s," +
-                "\"createdEpochSeconds\":%s}\\n' \"\${logical}\" \"\${created}\" " +
-                "> \"\${dst}.meta.json.tmp\"; " +
-                "/system/bin/mv \"\${dst}.sha256.tmp\" \"\${dst}.sha256\"; " +
-                "/system/bin/mv \"\${dst}.meta.json.tmp\" \"\${dst}.meta.json\"; " +
-                "/system/bin/mv \"\${dst}.tmp\" \"\${dst}\"",
+        val file = portableBackupFileName(name, timestamp, normalizedDisplayName)
+        val path = "${ChrootContract.PORTABLE_BACKUP_DIRECTORY}/$file"
+        val result = root.execute(
+            "set -e; src='${ChrootContract.IMAGE_DIRECTORY}/$name.img'; dst='$path'; " +
+                "tmp='${path}.partial'; [ -f \"\${src}\" ]; [ ! -e \"\${dst}\" ]; " +
+                "/system/bin/rm -f \"\${tmp}\"; /system/bin/mkdir -p " +
+                "'${ChrootContract.PORTABLE_BACKUP_DIRECTORY}'; " +
+                "actual=\$(/system/bin/sha256sum \"\${src}\" | /system/bin/cut -d' ' -f1); " +
+                "'${ChrootContract.SPARSE_COPY_PATH}' --export-archive \"\${src}\" \"\${tmp}\" " +
+                "'$name' '$encodedDisplayName' \"\${actual}\"; " +
+                "/system/bin/mv \"\${tmp}\" \"\${dst}\"; " +
+                "logical=\$(/system/bin/stat -c %s \"\${src}\"); " +
+                "bytes=\$(/system/bin/stat -c %s \"\${dst}\"); " +
+                "blocks=\$(( (bytes + 1023) / 1024 )); " +
+                "mtime=\$(/system/bin/stat -c %Y \"\${dst}\"); " +
+                "/system/bin/printf 'CNTERMUX_PORTABLE_CREATED|%s|%s|%s\\n' " +
+                "\"\${logical}\" \"\${blocks}\" \"\${mtime}\"",
             LONG_TIMEOUT_MILLIS,
-        ).requireSuccess()
-        return path
+        )
+        if (!result.isSuccess) {
+            root.execute(
+                "/system/bin/rm -f '${path}.partial'",
+                DEFAULT_TIMEOUT_MILLIS,
+            )
+            result.requireSuccess()
+        }
+        val fields = result.stdout.lineSequence()
+            .firstOrNull { it.startsWith("CNTERMUX_PORTABLE_CREATED|") }
+            ?.split('|')
+        check(fields?.size == 4) { "备份归档完成，但没有返回容量信息" }
+        return BackupEntry(
+            fileName = file,
+            path = path,
+            instanceName = name,
+            sizeBytes = (fields[2].toLongOrNull() ?: 0) * 1024,
+            modifiedEpochSeconds = fields[3].toLongOrNull() ?: System.currentTimeMillis() / 1_000,
+            checksumPresent = true,
+            displayName = normalizedDisplayName,
+            logicalSizeBytes = fields[1].toLongOrNull() ?: 0,
+            metadataPresent = true,
+            portableArchive = true,
+        )
     }
 
     suspend fun listBackups(): List<BackupEntry> {
@@ -626,14 +718,43 @@ class ChrootClient(
         return parseBackupSnapshot(result.stdout.lineSequence())
     }
 
-    suspend fun renameBackup(backup: BackupEntry, displayName: String): CommandResult {
+    suspend fun renameBackup(backup: BackupEntry, displayName: String): BackupEntry {
         requireSafeBackup(backup)
         val normalizedDisplayName = requireValidBackupDisplayName(displayName)
         val encodedDisplayName = Base64.encodeToString(
             normalizedDisplayName.toByteArray(Charsets.UTF_8),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
         )
-        return root.execute(
+        if (backup.portableArchive) {
+            bootstrap().requireSuccess()
+            val match = PORTABLE_BACKUP_REGEX.matchEntire(backup.fileName)
+                ?: error("便携备份文件名不合法")
+            val file = portableBackupFileName(
+                backup.instanceName,
+                match.groupValues[2],
+                normalizedDisplayName,
+            )
+            val path = "${ChrootContract.PORTABLE_BACKUP_DIRECTORY}/$file"
+            root.execute(
+                "set -e; [ -f '${backup.path}' ]; " +
+                    if (path == backup.path) {
+                        "'${ChrootContract.SPARSE_COPY_PATH}' --rename-archive " +
+                            "'${backup.path}' '$encodedDisplayName'"
+                    } else {
+                        "[ ! -e '$path' ]; '${ChrootContract.SPARSE_COPY_PATH}' " +
+                            "--rename-archive '${backup.path}' '$encodedDisplayName'; " +
+                            "/system/bin/mv '${backup.path}' '$path'"
+                    },
+                DEFAULT_TIMEOUT_MILLIS,
+            ).requireSuccess()
+            return backup.copy(
+                fileName = file,
+                path = path,
+                displayName = normalizedDisplayName,
+                metadataPresent = true,
+            )
+        }
+        root.execute(
             "set -e; src='${backup.path}'; [ -f \"\${src}\" ]; " +
                 "logical=\$(/system/bin/stat -c %s \"\${src}\"); " +
                 "created=\$(/system/bin/stat -c %Y \"\${src}\"); " +
@@ -643,11 +764,26 @@ class ChrootClient(
                 "> \"\${src}.meta.json.tmp\"; " +
                 "/system/bin/mv -f \"\${src}.meta.json.tmp\" \"\${src}.meta.json\"",
             DEFAULT_TIMEOUT_MILLIS,
-        )
+        ).requireSuccess()
+        return backup.copy(displayName = normalizedDisplayName, metadataPresent = true)
     }
 
     suspend fun validateBackup(backup: BackupEntry): String {
         requireSafeBackup(backup)
+        if (backup.portableArchive) {
+            bootstrap().requireSuccess()
+            val result = root.execute(
+                "'${ChrootContract.SPARSE_COPY_PATH}' --inspect-archive '${backup.path}'",
+                DEFAULT_TIMEOUT_MILLIS,
+            ).requireSuccess()
+            val fields = result.stdout.lineSequence()
+                .firstOrNull { it.startsWith("CNTERMUX_ARCHIVE|") }
+                ?.split('|')
+            require(fields?.size == 5 && fields[2] == backup.instanceName) {
+                "便携备份元数据与文件名不一致"
+            }
+            return fields[2]
+        }
         if (backup.checksumPresent) {
             root.execute(
                 "cd '${ChrootContract.BACKUP_DIRECTORY}' && /system/bin/sha256sum -c '${backup.fileName}.sha256'",
@@ -659,7 +795,26 @@ class ChrootClient(
 
     suspend fun restore(backup: BackupEntry): CommandResult {
         requireSafeBackup(backup)
+        val ready = bootstrap()
+        if (!ready.isSuccess) return ready
         val target = "${ChrootContract.IMAGE_DIRECTORY}/${backup.instanceName}.img"
+        if (backup.portableArchive) {
+            val image = "${ChrootContract.CACHE_DIRECTORY}/restore-${backup.instanceName}.img"
+            return root.execute(
+                "set -e; archive='${backup.path}'; image='$image'; [ -f \"\${archive}\" ]; " +
+                    "/system/bin/rm -f \"\${image}\"; " +
+                    "info=\$('${ChrootContract.SPARSE_COPY_PATH}' --inspect-archive \"\${archive}\"); " +
+                    "expected=\$(/system/bin/printf '%s\\n' \"\${info}\" | /system/bin/cut -d'|' -f5); " +
+                    "'${ChrootContract.SPARSE_COPY_PATH}' --restore-archive " +
+                    "\"\${archive}\" \"\${image}\"; " +
+                    "actual=\$(/system/bin/sha256sum \"\${image}\" | /system/bin/cut -d' ' -f1); " +
+                    "[ \"\${actual}\" = \"\${expected}\" ]; " +
+                    "/system/bin/chcon u:object_r:magisk_file:s0 \"\${image}\" 2>/dev/null || true; " +
+                    "/system/bin/mv -f \"\${image}\" '$target'; " +
+                    "/system/bin/printf 'CNTERMUX_ARCHIVE_RESTORED\\n'",
+                LONG_TIMEOUT_MILLIS,
+            )
+        }
         return root.execute(
             "set -e; src='${backup.path}'; dst='$target'; [ -f \"\${src}\" ]; " +
                 "tmp='${ChrootContract.CACHE_DIRECTORY}/restore-${backup.instanceName}.img'; /system/bin/rm -f \"\${tmp}\"; " +
@@ -672,6 +827,12 @@ class ChrootClient(
 
     suspend fun deleteBackup(backup: BackupEntry): CommandResult {
         requireSafeBackup(backup)
+        if (backup.portableArchive) {
+            return root.execute(
+                "/system/bin/rm -f '${backup.path}' '${backup.path}.partial'",
+                DEFAULT_TIMEOUT_MILLIS,
+            )
+        }
         return root.execute(
             "/system/bin/rm -f '${backup.path}' '${backup.path}.sha256' " +
                 "'${backup.path}.meta.json' '${backup.path}.meta.json.tmp'",
@@ -757,7 +918,19 @@ class ChrootClient(
             "[ ! -s \"\${f}.meta.json\" ] || " +
             "meta=\$(/system/bin/base64 \"\${f}.meta.json\" | /system/bin/tr -d '\\n'); " +
             "/system/bin/printf '${prefix}%s|%s|%s|%s|%s|%s\\n' " +
-            "\"\${n}\" \"\${blocks}\" \"\${logical}\" \"\${mtime}\" \"\${sum}\" \"\${meta}\"; done; "
+            "\"\${n}\" \"\${blocks}\" \"\${logical}\" \"\${mtime}\" \"\${sum}\" \"\${meta}\"; done; " +
+            "for f in '${ChrootContract.PORTABLE_BACKUP_DIRECTORY}'/*.cnubuntu; do " +
+            "[ -f \"\${f}\" ] || continue; n=\${f##*/}; " +
+            "bytes=\$(/system/bin/stat -c %s \"\${f}\"); " +
+            "blocks=\$(( (bytes + 1023) / 1024 )); " +
+            "mtime=\$(/system/bin/stat -c %Y \"\${f}\"); " +
+            "info=\$('${ChrootContract.SPARSE_COPY_PATH}' --inspect-archive \"\${f}\" 2>/dev/null) || continue; " +
+            "logical=\$(/system/bin/printf '%s\\n' \"\${info}\" | /system/bin/cut -d'|' -f2); " +
+            "archive_instance=\$(/system/bin/printf '%s\\n' \"\${info}\" | /system/bin/cut -d'|' -f3); " +
+            "file_instance=\${n%%--*}; [ \"\${archive_instance}\" = \"\${file_instance}\" ] || continue; " +
+            "display=\$(/system/bin/printf '%s\\n' \"\${info}\" | /system/bin/cut -d'|' -f4); " +
+            "/system/bin/printf '${prefix}%s|%s|%s|%s|1|%s\\n' " +
+            "\"\${n}\" \"\${blocks}\" \"\${logical}\" \"\${mtime}\" \"\${display}\"; done; "
 
     private suspend fun executeScript(
         name: String,
@@ -801,8 +974,14 @@ class ChrootClient(
     }
 
     private fun requireSafeBackup(backup: BackupEntry) {
-        require(BACKUP_REGEX.matches(backup.fileName)) { "备份文件名不合法" }
-        require(backup.path == "${ChrootContract.BACKUP_DIRECTORY}/${backup.fileName}") { "备份路径不安全" }
+        val expectedDirectory = if (backup.portableArchive) {
+            require(PORTABLE_BACKUP_REGEX.matches(backup.fileName)) { "便携备份文件名不合法" }
+            ChrootContract.PORTABLE_BACKUP_DIRECTORY
+        } else {
+            require(BACKUP_REGEX.matches(backup.fileName)) { "备份文件名不合法" }
+            ChrootContract.BACKUP_DIRECTORY
+        }
+        require(backup.path == "$expectedDirectory/${backup.fileName}") { "备份路径不安全" }
     }
 
     private fun requireValidBackupDisplayName(displayName: String): String {
@@ -837,6 +1016,30 @@ class ChrootClient(
         const val DEFAULT_PASSWORD_UNCHANGED_MARKER = "ROOT_PASSWORD_DEFAULT_UNCHANGED"
         private val NAME_REGEX = Regex("^[A-Za-z0-9][A-Za-z0-9_-]{0,31}${'$'}")
         private val BACKUP_REGEX = Regex("^([A-Za-z0-9][A-Za-z0-9_-]{0,31})_[0-9]{8}_[0-9]{6}\\.img\\.sparse${'$'}")
+        private val PORTABLE_BACKUP_REGEX = Regex(
+            "^([A-Za-z0-9][A-Za-z0-9_-]{0,31})--([0-9]{8}_[0-9]{6})--" +
+                "([\\p{L}\\p{N}._ -]{1,32})\\.cnubuntu${'$'}",
+        )
+
+        private fun portableBackupFileName(
+            instanceName: String,
+            timestamp: String,
+            displayName: String,
+        ): String {
+            requireValidName(instanceName)
+            require(Regex("[0-9]{8}_[0-9]{6}").matches(timestamp)) { "备份时间格式不正确" }
+            val safeLabel = displayName.map { character ->
+                when {
+                    character.isLetterOrDigit() -> character
+                    character in setOf(' ', '.', '_', '-') -> character
+                    else -> '_'
+                }
+            }.joinToString("")
+                .trim(' ', '.', '_', '-')
+                .ifBlank { "备份" }
+                .take(MAX_PORTABLE_FILE_LABEL_LENGTH)
+            return "$instanceName--$timestamp--$safeLabel.cnubuntu"
+        }
 
         internal fun parseRuntimeSnapshot(raw: String): List<ChrootRuntimeRecord> =
             raw.lineSequence().mapNotNull { line ->
@@ -860,23 +1063,39 @@ class ChrootClient(
             lines.mapNotNull { line ->
                 val parts = line.trim().split('|')
                 if (parts.size !in setOf(4, 6)) return@mapNotNull null
-                val match = BACKUP_REGEX.matchEntire(parts[0]) ?: return@mapNotNull null
+                val legacyMatch = BACKUP_REGEX.matchEntire(parts[0])
+                val portableMatch = PORTABLE_BACKUP_REGEX.matchEntire(parts[0])
+                if (legacyMatch == null && portableMatch == null) return@mapNotNull null
+                val portable = portableMatch != null
                 val modernFormat = parts.size == 6
-                val metadata = if (modernFormat) decodeBackupMetadata(parts[5]) else null
+                val metadata = when {
+                    !modernFormat -> null
+                    portable -> decodePortableDisplayName(parts[5])
+                    else -> decodeBackupMetadata(parts[5])
+                }
+                val instanceName = portableMatch?.groupValues?.get(1)
+                    ?: legacyMatch!!.groupValues[1]
                 BackupEntry(
                     fileName = parts[0],
-                    path = "${ChrootContract.BACKUP_DIRECTORY}/${parts[0]}",
-                    instanceName = match.groupValues[1],
+                    path = "${if (portable) {
+                        ChrootContract.PORTABLE_BACKUP_DIRECTORY
+                    } else {
+                        ChrootContract.BACKUP_DIRECTORY
+                    }}/${parts[0]}",
+                    instanceName = instanceName,
                     sizeBytes = (parts[1].toLongOrNull() ?: 0) * 1024,
                     modifiedEpochSeconds = parts[if (modernFormat) 3 else 2].toLongOrNull() ?: 0,
                     checksumPresent = parts[if (modernFormat) 4 else 3] == "1",
-                    displayName = metadata ?: match.groupValues[1],
+                    displayName = metadata
+                        ?: portableMatch?.groupValues?.get(3)
+                        ?: instanceName,
                     logicalSizeBytes = if (modernFormat) {
                         parts[2].toLongOrNull() ?: 0
                     } else {
                         0
                     },
-                    metadataPresent = metadata != null,
+                    metadataPresent = portable || metadata != null,
+                    portableArchive = portable,
                 )
             }.sortedByDescending { it.modifiedEpochSeconds }.toList()
 
@@ -896,8 +1115,23 @@ class ChrootClient(
             }
         }.getOrNull()
 
+        private fun decodePortableDisplayName(encodedDisplayName: String): String? = runCatching {
+            if (encodedDisplayName.isBlank()) return@runCatching null
+            String(
+                java.util.Base64.getUrlDecoder().decode(encodedDisplayName),
+                Charsets.UTF_8,
+            ).trim().takeIf {
+                it.isNotEmpty() && it.length <= MAX_BACKUP_DISPLAY_NAME_LENGTH &&
+                    it.none { character ->
+                        character == '\n' || character == '\r' || character == '\u0000'
+                    }
+            }
+        }.getOrNull()
+
         private val DISPLAY_NAME_JSON_REGEX =
             Regex("\\\"displayNameBase64\\\":\\\"([A-Za-z0-9_-]+)\\\"")
+
+        private const val MAX_PORTABLE_FILE_LABEL_LENGTH = 32
 
         internal fun parseAutoStartSnapshot(
             lines: Sequence<String>,

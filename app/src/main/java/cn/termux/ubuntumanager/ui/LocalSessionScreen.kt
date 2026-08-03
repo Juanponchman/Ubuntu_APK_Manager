@@ -9,14 +9,19 @@ import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.text.Editable
 import android.text.InputType
+import android.text.Selection
+import android.text.SpannableStringBuilder
 import android.view.KeyEvent
+import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
-import android.view.inputmethod.InputConnectionWrapper
 import android.view.inputmethod.InputMethodManager
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -77,6 +82,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -150,6 +157,7 @@ fun LocalSessionScreen(
     var ctrlMode by remember { mutableStateOf(TerminalModifierMode.OFF) }
     var altMode by remember { mutableStateOf(TerminalModifierMode.OFF) }
     var scrollState by remember { mutableStateOf(TerminalScrollState()) }
+    var lastTerminalInput by remember { mutableStateOf<TerminalInputFingerprint?>(null) }
     var confirmEndSession by remember { mutableStateOf(false) }
     var pageLoading by remember(sessionState.port) { mutableStateOf(true) }
     var pageError by remember(sessionState.port) { mutableStateOf<String?>(null) }
@@ -167,8 +175,7 @@ fun LocalSessionScreen(
     }
     DisposableEffect(instanceName) {
         onDispose {
-            terminalWebView?.stopLoading()
-            terminalWebView?.destroy()
+            terminalWebView?.releaseTerminal()
             terminalWebView = null
             onCloseSession()
         }
@@ -184,26 +191,9 @@ fun LocalSessionScreen(
         val encoded = JSONObject.quote(text)
         val script = """
             (function() {
-              const target = document.querySelector('.xterm-helper-textarea');
-              if (!target) return 'missing';
-              const value = $encoded;
-              window.__ubuntuBypassModifiedInput = true;
-              try {
-                const setter = Object.getOwnPropertyDescriptor(
-                  HTMLTextAreaElement.prototype, 'value'
-                ).set;
-                setter.call(target, value);
-                target.dispatchEvent(new InputEvent('input', {
-                  bubbles: true,
-                  inputType: 'insertText',
-                  data: value
-                }));
-                return 'ok';
-              } finally {
-                window.setTimeout(function () {
-                  window.__ubuntuBypassModifiedInput = false;
-                }, 0);
-              }
+              if (!window.__ubuntuSendRaw) return 'missing';
+              window.__ubuntuSendRaw($encoded);
+              return 'ok';
             })();
         """.trimIndent()
         webView.evaluateJavascript(script) { result ->
@@ -216,6 +206,16 @@ fun LocalSessionScreen(
                 ).show()
             }
         }
+    }
+
+    fun sendRawToTerminal(text: String) {
+        val webView = terminalWebView ?: return
+        if (pageLoading) return
+        webView.evaluateJavascript(
+            "window.__ubuntuSendRaw && window.__ubuntuSendRaw(" +
+                JSONObject.quote(text) + ");",
+            null,
+        )
     }
 
     fun sendTerminalKey(
@@ -250,14 +250,36 @@ fun LocalSessionScreen(
         webView.evaluateJavascript(script, null)
     }
 
-    fun sendModifiedInput(value: String) {
-        val ctrlActive = ctrlMode != TerminalModifierMode.OFF
-        val altActive = altMode != TerminalModifierMode.OFF
-        if (!ctrlActive && !altActive) {
-            sendToTerminal(value)
+    fun sendAdaptiveInput(value: String, source: String) {
+        if (value.isEmpty()) return
+        val now = SystemClock.uptimeMillis()
+        val previous = lastTerminalInput
+        if (
+            previous?.value == value &&
+            previous.source != source &&
+            now - previous.timestamp < TERMINAL_CROSS_SOURCE_DEDUPE_MILLIS
+        ) {
             return
         }
-        sendToTerminal(TerminalKeys.applyModifiers(value, ctrlActive, altActive))
+        lastTerminalInput = TerminalInputFingerprint(value, source, now)
+        val ctrlActive = ctrlMode != TerminalModifierMode.OFF
+        val altActive = altMode != TerminalModifierMode.OFF
+        val modifierCharacter = value.singleOrNull()?.takeIf { it.code in 32..126 }
+        if (!ctrlActive && !altActive || modifierCharacter == null) {
+            if (modifierCharacter == null) {
+                ctrlMode = TerminalModifierMode.OFF
+                altMode = TerminalModifierMode.OFF
+            }
+            sendRawToTerminal(value)
+            return
+        }
+        sendRawToTerminal(
+            TerminalKeys.applyModifiers(
+                modifierCharacter.toString(),
+                ctrlActive,
+                altActive,
+            ),
+        )
         if (ctrlMode == TerminalModifierMode.ONCE) ctrlMode = TerminalModifierMode.OFF
         if (altMode == TerminalModifierMode.ONCE) altMode = TerminalModifierMode.OFF
     }
@@ -268,7 +290,8 @@ fun LocalSessionScreen(
         val altActive = stroke.alt || altMode != TerminalModifierMode.OFF
         val printable = TerminalKeys.printableText(stroke)
         if (printable != null) {
-            sendToTerminal(TerminalKeys.applyModifiers(printable, ctrlActive, altActive))
+            val value = TerminalKeys.applyModifiers(printable, ctrlActive, altActive)
+            sendRawToTerminal(value)
         } else {
             sendTerminalKey(
                 key = option.javascriptKey,
@@ -360,7 +383,9 @@ fun LocalSessionScreen(
                         onWebViewReady = { terminalWebView = it },
                         onPageLoading = {
                             pageLoading = it
-                            if (it) pageError = null
+                            if (it) {
+                                pageError = null
+                            }
                         },
                         onPageError = {
                             pageLoading = false
@@ -368,7 +393,16 @@ fun LocalSessionScreen(
                         },
                         ctrlMode = ctrlMode,
                         altMode = altMode,
-                        onModifiedInput = ::sendModifiedInput,
+                        historySnapshot = sessionState.historySnapshot,
+                        onModifiedInput = ::sendAdaptiveInput,
+                        onCopySelection = { selected ->
+                            copyCommand(context, selected)
+                            Toast.makeText(
+                                context,
+                                "已复制选中内容",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        },
                         onScrollChanged = {
                                 position,
                                 total,
@@ -730,6 +764,14 @@ private data class TerminalScrollState(
     val reviewing: Boolean = false,
 )
 
+private data class TerminalInputFingerprint(
+    val value: String,
+    val source: String,
+    val timestamp: Long,
+)
+
+private const val TERMINAL_CROSS_SOURCE_DEDUPE_MILLIS = 90L
+
 internal fun terminalShortcutColumnCount(
     availableWidthDp: Float,
     enabledCount: Int,
@@ -923,107 +965,193 @@ private fun TerminalScrollbar(
 }
 
 private class TerminalInputWebView(context: Context) : WebView(context) {
-    var onNativeModifiedInput: ((String) -> Unit)? = null
+    var onNativeInput: ((String, String) -> Unit)? = null
+    var appliedPageState: String? = null
 
     private var ctrlActive = false
     private var altActive = false
-    private var captureConsumed = false
-    private var inputConnectionGeneration = 0
-    private var blockedThroughGeneration = 0
-
-    private val commandMode: Boolean
-        get() = ctrlActive || altActive
+    private var released = false
+    private val editorBuffer = SpannableStringBuilder().apply {
+        Selection.setSelection(this, 0)
+    }
 
     fun updateModifiers(ctrlActive: Boolean, altActive: Boolean) {
         if (this.ctrlActive == ctrlActive && this.altActive == altActive) return
-        val wasCommandMode = commandMode
         this.ctrlActive = ctrlActive
         this.altActive = altActive
-        captureConsumed = false
-        if (wasCommandMode && !commandMode) {
-            blockedThroughGeneration = inputConnectionGeneration
-        }
-        post {
-            val inputManager =
-                context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            inputManager.restartInput(this)
-        }
+        BaseInputConnection.removeComposingSpans(editorBuffer)
+        restartTerminalInput(clearHelper = true)
     }
 
-    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
-        val base = super.onCreateInputConnection(outAttrs) ?: return null
-        val generation = ++inputConnectionGeneration
-        if (commandMode) {
-            outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
-                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
-                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            outAttrs.imeOptions = outAttrs.imeOptions or
-                EditorInfo.IME_FLAG_NO_EXTRACT_UI or
-                EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
-        }
-        return object : InputConnectionWrapper(base, false) {
+    fun releaseTerminal() {
+        if (released) return
+        released = true
+        stopLoading()
+        removeJavascriptInterface(TERMINAL_BRIDGE_NAME)
+        destroy()
+    }
+
+    override fun onCheckIsTextEditor(): Boolean = true
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
+            InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or
+            EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+            EditorInfo.IME_FLAG_NO_FULLSCREEN or
+            EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        outAttrs.initialSelStart = Selection.getSelectionStart(editorBuffer)
+        outAttrs.initialSelEnd = Selection.getSelectionEnd(editorBuffer)
+        return object : BaseInputConnection(this@TerminalInputWebView, true) {
+            private var deletingInCodePoints = false
+
+            override fun getEditable(): Editable = editorBuffer
+
             override fun setComposingText(
                 text: CharSequence?,
                 newCursorPosition: Int,
-            ): Boolean = if (captureImeText(text, generation)) {
-                true
-            } else {
-                super.setComposingText(text, newCursorPosition)
-            }
+            ): Boolean = super.setComposingText(text ?: "", newCursorPosition)
 
             override fun commitText(
                 text: CharSequence?,
                 newCursorPosition: Int,
-            ): Boolean = if (captureImeText(text, generation)) {
-                true
-            } else {
-                super.commitText(text, newCursorPosition)
+            ): Boolean {
+                val value = text?.toString().orEmpty()
+                val accepted = super.commitText(text ?: "", newCursorPosition)
+                if (value.isNotEmpty()) {
+                    dispatchImeInput(
+                        if (value == "\n") "\r" else value,
+                        "ime-commit",
+                    )
+                }
+                trimEditorBuffer()
+                return accepted
             }
 
             override fun sendKeyEvent(event: KeyEvent): Boolean {
-                if (generation <= blockedThroughGeneration) return true
-                if (commandMode && event.action == KeyEvent.ACTION_DOWN) {
-                    val unicode = event.unicodeChar
-                    if (unicode in 32..126) {
-                        captureImeText(unicode.toChar().toString(), generation)
-                        return true
-                    }
+                val value = terminalValueFor(event)
+                if (value == null) return super.sendKeyEvent(event)
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    dispatchImeInput(value, "ime-key-event")
                 }
-                if (commandMode && captureConsumed) return true
-                return super.sendKeyEvent(event)
+                return true
             }
 
             override fun deleteSurroundingText(
                 beforeLength: Int,
                 afterLength: Int,
-            ): Boolean = if (generation <= blockedThroughGeneration || commandMode) {
-                true
-            } else {
-                super.deleteSurroundingText(beforeLength, afterLength)
+            ): Boolean {
+                if (!deletingInCodePoints && !hasComposingText()) {
+                    if (beforeLength > 0) {
+                        dispatchImeInput("\u007f".repeat(beforeLength), "ime-delete")
+                    }
+                    if (afterLength > 0) {
+                        dispatchImeInput("\u001b[3~".repeat(afterLength), "ime-delete")
+                    }
+                }
+                return super.deleteSurroundingText(beforeLength, afterLength)
             }
 
             override fun deleteSurroundingTextInCodePoints(
                 beforeLength: Int,
                 afterLength: Int,
-            ): Boolean = if (generation <= blockedThroughGeneration || commandMode) {
-                true
-            } else {
-                super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)
+            ): Boolean {
+                if (!hasComposingText()) {
+                    if (beforeLength > 0) {
+                        dispatchImeInput("\u007f".repeat(beforeLength), "ime-delete-codepoint")
+                    }
+                    if (afterLength > 0) {
+                        dispatchImeInput(
+                            "\u001b[3~".repeat(afterLength),
+                            "ime-delete-codepoint",
+                        )
+                    }
+                }
+                deletingInCodePoints = true
+                return try {
+                    super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)
+                } finally {
+                    deletingInCodePoints = false
+                }
             }
+
+            override fun performEditorAction(actionCode: Int): Boolean {
+                dispatchImeInput("\r", "ime-editor-action")
+                return true
+            }
+
+            override fun performContextMenuAction(id: Int): Boolean {
+                if (id != android.R.id.paste) return super.performContextMenuAction(id)
+                val clipboard = context.getSystemService(
+                    Context.CLIPBOARD_SERVICE,
+                ) as ClipboardManager
+                val value = clipboard.primaryClip
+                    ?.getItemAt(0)
+                    ?.coerceToText(context)
+                    ?.toString()
+                    .orEmpty()
+                if (value.isNotEmpty()) commitText(value, 1)
+                return true
+            }
+
+            private fun hasComposingText(): Boolean =
+                BaseInputConnection.getComposingSpanStart(editorBuffer) >= 0
         }
     }
 
-    private fun captureImeText(text: CharSequence?, generation: Int): Boolean {
-        if (generation <= blockedThroughGeneration) return true
-        if (!commandMode) return false
-        if (captureConsumed) return true
-        val value = text?.firstOrNull { it.code in 32..126 }?.toString()
-        if (value != null) {
-            captureConsumed = true
-            blockedThroughGeneration = generation
-            post { onNativeModifiedInput?.invoke(value) }
+    private fun terminalValueFor(event: KeyEvent): String? = when (event.keyCode) {
+        KeyEvent.KEYCODE_ENTER,
+        KeyEvent.KEYCODE_NUMPAD_ENTER,
+        -> "\r"
+        KeyEvent.KEYCODE_DEL -> "\u007f"
+        KeyEvent.KEYCODE_FORWARD_DEL -> "\u001b[3~"
+        KeyEvent.KEYCODE_TAB -> "\t"
+        KeyEvent.KEYCODE_ESCAPE -> "\u001b"
+        KeyEvent.KEYCODE_DPAD_UP -> "\u001b[A"
+        KeyEvent.KEYCODE_DPAD_DOWN -> "\u001b[B"
+        KeyEvent.KEYCODE_DPAD_RIGHT -> "\u001b[C"
+        KeyEvent.KEYCODE_DPAD_LEFT -> "\u001b[D"
+        KeyEvent.KEYCODE_MOVE_HOME -> "\u001b[H"
+        KeyEvent.KEYCODE_MOVE_END -> "\u001b[F"
+        KeyEvent.KEYCODE_PAGE_UP -> "\u001b[5~"
+        KeyEvent.KEYCODE_PAGE_DOWN -> "\u001b[6~"
+        else -> event.unicodeChar
+            .takeIf { it > 0 }
+            ?.let { String(Character.toChars(it)) }
+    }
+
+    private fun dispatchImeInput(value: String, source: String) {
+        if (value.isEmpty()) return
+        post { onNativeInput?.invoke(value, source) }
+    }
+
+    private fun trimEditorBuffer() {
+        if (editorBuffer.length <= MAX_EDITOR_BUFFER_CHARS) return
+        if (BaseInputConnection.getComposingSpanStart(editorBuffer) >= 0) return
+        editorBuffer.delete(0, editorBuffer.length - RETAINED_EDITOR_BUFFER_CHARS)
+        Selection.setSelection(editorBuffer, editorBuffer.length)
+    }
+
+    private fun restartTerminalInput(clearHelper: Boolean) {
+        val action = {
+            if (clearHelper) {
+                evaluateJavascript(
+                    "window.__ubuntuResetImeAfterModifier && " +
+                        "window.__ubuntuResetImeAfterModifier();",
+                    null,
+                )
+            }
+            val inputManager =
+                context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            inputManager.restartInput(this)
         }
-        return true
+        post(action)
+    }
+
+    private companion object {
+        const val MAX_EDITOR_BUFFER_CHARS = 512
+        const val RETAINED_EDITOR_BUFFER_CHARS = 128
     }
 }
 
@@ -1033,19 +1161,26 @@ private fun LocalTerminalWebView(
     url: String,
     port: Int,
     backend: LocalSessionBackend,
+    historySnapshot: String,
     onWebViewReady: (TerminalInputWebView) -> Unit,
     onPageLoading: (Boolean) -> Unit,
     onPageError: (String) -> Unit,
     ctrlMode: TerminalModifierMode,
     altMode: TerminalModifierMode,
-    onModifiedInput: (String) -> Unit,
+    onModifiedInput: (String, String) -> Unit,
+    onCopySelection: (String) -> Unit,
     onScrollChanged: (Int, Int, Int, Boolean, Float, Float, Boolean) -> Unit,
 ) {
     val currentModifiedInput = rememberUpdatedState(onModifiedInput)
+    val currentCopySelection = rememberUpdatedState(onCopySelection)
     val currentScrollChanged = rememberUpdatedState(onScrollChanged)
+    var rendererGeneration by remember(url) { mutableIntStateOf(0) }
     val bridge: TerminalJavascriptBridge = remember {
         TerminalJavascriptBridge(
-            onModifiedInput = { currentModifiedInput.value(it) },
+            onModifiedInput = { value ->
+                currentModifiedInput.value(value, "web-keydown")
+            },
+            onCopySelection = { currentCopySelection.value(it) },
             onScrollChanged = {
                     position,
                     total,
@@ -1067,99 +1202,132 @@ private fun LocalTerminalWebView(
             },
         )
     }
-    AndroidView(
-        modifier = Modifier.fillMaxSize(),
-        factory = { context ->
-            TerminalInputWebView(context).apply {
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                )
-                setBackgroundColor(Color.Black.toArgb())
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                settings.allowFileAccess = false
-                settings.allowContentAccess = false
-                settings.javaScriptCanOpenWindowsAutomatically = false
-                settings.setSupportMultipleWindows(false)
-                settings.mediaPlaybackRequiresUserGesture = true
-                settings.safeBrowsingEnabled = true
-                onNativeModifiedInput = { currentModifiedInput.value(it) }
-                updateModifiers(
-                    ctrlActive = ctrlMode != TerminalModifierMode.OFF,
-                    altActive = altMode != TerminalModifierMode.OFF,
-                )
-                addJavascriptInterface(bridge, TERMINAL_BRIDGE_NAME)
-                webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                    ): WebResourceResponse? {
-                        val uri = request?.url ?: return null
-                        if (
-                            request.method != "GET" ||
-                            uri.path != "/" ||
-                            !uri.isAllowedLocalSessionUri(port)
+    key(rendererGeneration) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { context ->
+                TerminalInputWebView(context).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                    setBackgroundColor(Color.Black.toArgb())
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
+                    settings.javaScriptCanOpenWindowsAutomatically = false
+                    settings.setSupportMultipleWindows(false)
+                    settings.mediaPlaybackRequiresUserGesture = true
+                    settings.safeBrowsingEnabled = true
+                    onNativeInput = { value, source ->
+                        currentModifiedInput.value(value, source)
+                    }
+                    updateModifiers(
+                        ctrlActive = ctrlMode != TerminalModifierMode.OFF,
+                        altActive = altMode != TerminalModifierMode.OFF,
+                    )
+                    addJavascriptInterface(bridge, TERMINAL_BRIDGE_NAME)
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                        ): WebResourceResponse? {
+                            val uri = request?.url ?: return null
+                            if (
+                                request.method != "GET" ||
+                                uri.path != "/" ||
+                                !uri.isAllowedLocalSessionUri(port)
+                            ) {
+                                return null
+                            }
+                            return loadCompatibleTerminalPage(uri.toString())
+                        }
+
+                        override fun onPageStarted(
+                            view: WebView?,
+                            url: String?,
+                            favicon: Bitmap?,
                         ) {
-                            return null
+                            (view as? TerminalInputWebView)?.appliedPageState = null
+                            onPageLoading(true)
                         }
-                        return loadCompatibleTerminalPage(uri.toString())
-                    }
 
-                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                        onPageLoading(true)
-                    }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        onPageLoading(false)
-                        view?.evaluateJavascript(
-                            terminalPageStateScript(ctrlMode, altMode, backend),
-                            null,
-                        )
-                        view?.requestFocus()
-                    }
-
-                    override fun shouldOverrideUrlLoading(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                    ): Boolean {
-                        val uri = request?.url ?: return true
-                        return !uri.isAllowedLocalSessionUri(port)
-                    }
-
-                    override fun onReceivedError(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                        error: WebResourceError?,
-                    ) {
-                        if (request?.isForMainFrame == true) {
-                            onPageError(
-                                error?.description?.toString()
-                                    ?: "本地终端页面加载失败",
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            onPageLoading(false)
+                            val stateScript = terminalPageStateScript(
+                                ctrlMode,
+                                altMode,
+                                backend,
+                                historySnapshot,
                             )
+                            view?.evaluateJavascript(stateScript, null)
+                            (view as? TerminalInputWebView)?.appliedPageState = stateScript
+                            view?.requestFocus()
+                        }
+
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                        ): Boolean {
+                            val uri = request?.url ?: return true
+                            return !uri.isAllowedLocalSessionUri(port)
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            error: WebResourceError?,
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                onPageError(
+                                    error?.description?.toString()
+                                        ?: "本地终端页面加载失败",
+                                )
+                            }
+                        }
+
+                        override fun onRenderProcessGone(
+                            view: WebView?,
+                            detail: RenderProcessGoneDetail?,
+                        ): Boolean {
+                            (view as? TerminalInputWebView)?.appliedPageState = null
+                            onPageLoading(true)
+                            view?.post { rendererGeneration += 1 }
+                            return true
                         }
                     }
+                    onWebViewReady(this)
+                    loadUrl(url)
                 }
-                onWebViewReady(this)
-                loadUrl(url)
-            }
-        },
-        update = { view ->
-            if (view.url != url) view.loadUrl(url)
-            view.updateModifiers(
-                ctrlActive = ctrlMode != TerminalModifierMode.OFF,
-                altActive = altMode != TerminalModifierMode.OFF,
-            )
-            view.evaluateJavascript(
-                terminalPageStateScript(ctrlMode, altMode, backend),
-                null,
-            )
-        },
-    )
+            },
+            update = { view ->
+                if (view.url != url) view.loadUrl(url)
+                val stateScript = terminalPageStateScript(
+                    ctrlMode,
+                    altMode,
+                    backend,
+                    historySnapshot,
+                )
+                if (view.appliedPageState != stateScript) {
+                    view.updateModifiers(
+                        ctrlActive = ctrlMode != TerminalModifierMode.OFF,
+                        altActive = altMode != TerminalModifierMode.OFF,
+                    )
+                    view.evaluateJavascript(stateScript, null)
+                    view.appliedPageState = stateScript
+                }
+            },
+            onRelease = { view ->
+                view.releaseTerminal()
+            },
+        )
+    }
 }
 
 private class TerminalJavascriptBridge(
     private val onModifiedInput: (String) -> Unit,
+    private val onCopySelection: (String) -> Unit,
     private val onScrollChanged: (Int, Int, Int, Boolean, Float, Float, Boolean) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -1167,6 +1335,11 @@ private class TerminalJavascriptBridge(
     @JavascriptInterface
     fun onModifiedInput(value: String) {
         mainHandler.post { onModifiedInput(value) }
+    }
+
+    @JavascriptInterface
+    fun onCopySelection(value: String) {
+        if (value.isNotEmpty()) mainHandler.post { onCopySelection(value) }
     }
 
     @JavascriptInterface
@@ -1209,9 +1382,12 @@ private fun terminalPageStateScript(
     ctrlMode: TerminalModifierMode,
     altMode: TerminalModifierMode,
     backend: LocalSessionBackend,
+    historySnapshot: String,
 ): String = terminalModifierScript(ctrlMode, altMode) +
     "window.__ubuntuSetBackend && window.__ubuntuSetBackend(" +
-    JSONObject.quote(backend.name.lowercase()) + ");"
+    JSONObject.quote(backend.name.lowercase()) + ");" +
+    "window.__ubuntuSetHistory && window.__ubuntuSetHistory(" +
+    JSONObject.quote(historySnapshot) + ");"
 
 private fun Uri.isAllowedLocalSessionUri(port: Int): Boolean =
     scheme == "http" && host == "127.0.0.1" && this.port == port
@@ -1255,14 +1431,33 @@ private fun loadCompatibleTerminalPage(url: String): WebResourceResponse? = runC
 private const val TERMINAL_BRIDGE_NAME = "UbuntuTerminalBridge"
 
 private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <style>
+html,
+body {
+  -webkit-text-size-adjust: none !important;
+  text-size-adjust: none !important;
+}
 .xterm,
 .xterm-viewport,
 .xterm-screen {
   touch-action: none !important;
   overscroll-behavior-y: contain !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
 }
 .xterm-viewport::-webkit-scrollbar {
+  width: 0 !important;
+}
+.xterm-viewport {
+  overflow-x: hidden !important;
+}
+.terminal-history,
+.terminal-history * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+.terminal-history::-webkit-scrollbar {
   width: 0 !important;
 }
 .xterm-viewport::-webkit-scrollbar-track {
@@ -1318,6 +1513,7 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
     message.set(encoded, 1);
     nativeWebSocketSend.call(terminalSocket, message);
   }
+  window.__ubuntuSendRaw = sendTerminalData;
 
   var resizeTimer = null;
   var resizeBurstResetTimer = null;
@@ -1436,6 +1632,7 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
         !value || value.length !== 1 || value.charCodeAt(0) > 127) {
       return false;
     }
+    if (event && (event.isComposing || event.keyCode === 229)) return false;
     if (event) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -1461,20 +1658,11 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
     }
   }, true);
 
-  document.addEventListener('beforeinput', function (event) {
-    if (!isTerminalInput(event.target)) return;
-    markUserInteraction();
-    prepareForTerminalInput();
-    consumeModifiedInput(event.data, event);
-  }, true);
-
-  document.addEventListener('input', function (event) {
-    if (!isTerminalInput(event.target)) return;
-    prepareForTerminalInput();
-    if (consumeModifiedInput(event.data, event)) {
-      event.target.value = '';
-    }
-  }, true);
+  window.__ubuntuResetImeAfterModifier = function () {
+    var input = document.querySelector('.xterm-helper-textarea');
+    if (!input) return;
+    input.value = '';
+  };
 
   var viewport = null;
   var touchSurface = null;
@@ -1495,16 +1683,46 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
   var userHasInteracted = false;
   var historyReviewing = false;
   var reviewScrollTop = 0;
-  var activePointerId = null;
-  var pointerStartX = 0;
-  var pointerStartY = 0;
-  var pointerLastY = 0;
+  var activeTouchId = null;
+  var touchStartX = 0;
+  var touchStartY = 0;
+  var touchLastY = 0;
   var scrollGesture = false;
   var scrollbarDragging = false;
   var scrollbarGrabOffset = 0;
+  var longPressTimer = null;
+  var selectionMode = false;
+  var selectionKind = null;
+  var selectionGesture = false;
+  var selectionAnchor = null;
+  var selectionFocus = null;
+  var selectionAdjusting = null;
+  var selectionStartHandle = null;
+  var selectionEndHandle = null;
+  var selectionToolbar = null;
+  var selectionMagnifier = null;
+  var magnifierBefore = null;
+  var magnifierCaret = null;
+  var magnifierAfter = null;
+  var selectionMoveAnimationFrame = null;
+  var pendingSelectionX = 0;
+  var pendingSelectionY = 0;
+  var historySelectionStart = null;
+  var historySelectionEnd = null;
+  var historyLayer = null;
+  var historyPre = null;
+  var historyActive = false;
+  var historySource = '';
+  var historySourceLines = [];
+  var historyPrefixLines = [];
+  var lastTerminalFrame = null;
+  var historyRenderTimer = null;
   var pendingScrollPixels = 0;
   var scrollAnimationFrame = null;
+  var scrollReportTimer = null;
   var terminalRenderDisposable = null;
+  var observedTerminal = null;
+  var terminalTouchHandlersInstalled = false;
 
   window.__ubuntuSetBackend = function (backend) {
     sessionBackend = backend === 'tmux' || backend === 'dtach'
@@ -1529,6 +1747,8 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
   function prepareForTerminalInput() {
     if (!historyReviewing && !tmuxCopyMode && !tmuxCopyPending) return;
     historyReviewing = false;
+    historyActive = false;
+    if (historyLayer) historyLayer.style.display = 'none';
     pendingTmuxLines = 0;
     tmuxTouchPixels = 0;
     window.clearTimeout(tmuxCopyProbeTimer);
@@ -1558,6 +1778,159 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
     var height = parseFloat(window.getComputedStyle(row).height);
     return height > 0 ? height : 17;
   }
+
+  function readTerminalFrame() {
+    var terminal = window.term;
+    if (!terminal || !terminal.buffer || !terminal.buffer.active) return null;
+    var buffer = terminal.buffer.active;
+    var rows = Math.max(1, terminal.rows || 1);
+    var start = Math.max(0, buffer.viewportY || 0);
+    var frame = [];
+    for (var index = 0; index < rows; index++) {
+      var line = buffer.getLine(start + index);
+      frame.push(line ? line.translateToString(true) : '');
+    }
+    return frame;
+  }
+
+  function ensureHistoryLayer() {
+    if (!touchSurface || historyLayer) return;
+    var computed = window.getComputedStyle(touchSurface);
+    if (computed.position === 'static') touchSurface.style.position = 'relative';
+    historyLayer = document.createElement('div');
+    historyLayer.className = 'terminal-history';
+    historyLayer.style.position = 'absolute';
+    historyLayer.style.left = '0';
+    historyLayer.style.top = '0';
+    historyLayer.style.right = '0';
+    historyLayer.style.bottom = '0';
+    historyLayer.style.zIndex = '18';
+    historyLayer.style.display = 'none';
+    historyLayer.style.overflowY = 'auto';
+    historyLayer.style.overflowX = 'hidden';
+    historyLayer.style.touchAction = 'none';
+    historyLayer.style.background = '#000';
+    historyLayer.style.color = '#f2f2f2';
+    historyLayer.style.webkitOverflowScrolling = 'touch';
+    historyPre = document.createElement('pre');
+    historyPre.style.boxSizing = 'border-box';
+    historyPre.style.minHeight = '100%';
+    historyPre.style.width = '100%';
+    historyPre.style.margin = '0';
+    historyPre.style.padding = '2px 5px 2px 2px';
+    historyPre.style.whiteSpace = 'pre-wrap';
+    historyPre.style.wordBreak = 'break-all';
+    historyPre.style.overflowWrap = 'anywhere';
+    historyPre.style.fontFamily =
+      'serif-monospace,"Noto Sans CJK SC",sans-serif';
+    historyPre.style.fontSize = '10px';
+    historyPre.style.lineHeight = '1.2';
+    historyPre.style.letterSpacing = '0';
+    historyLayer.appendChild(historyPre);
+    touchSurface.appendChild(historyLayer);
+    historyLayer.addEventListener('scroll', function () {
+      historyReviewing = true;
+      scheduleScrollReport();
+    }, {passive: true});
+  }
+
+  function framesMatch(left, leftStart, right, rightEnd) {
+    for (var index = 0; index < rightEnd; index++) {
+      if (left[leftStart + index] !== right[index]) return false;
+    }
+    return true;
+  }
+
+  function updateHistoryFrame() {
+    var frame = readTerminalFrame();
+    if (!frame) return;
+    if (!lastTerminalFrame) {
+      var prefixCount = Math.max(0, historySourceLines.length - frame.length);
+      historyPrefixLines = historySourceLines.slice(0, prefixCount);
+      lastTerminalFrame = frame;
+      return;
+    }
+    var commonLength = Math.min(lastTerminalFrame.length, frame.length);
+    var shift = 0;
+    for (var candidate = 1; candidate < commonLength; candidate++) {
+      if (framesMatch(
+          lastTerminalFrame,
+          candidate,
+          frame,
+          commonLength - candidate
+      )) {
+        shift = candidate;
+        break;
+      }
+    }
+    if (shift > 0) {
+      historyPrefixLines = historyPrefixLines.concat(
+        lastTerminalFrame.slice(0, shift)
+      );
+      if (historyPrefixLines.length > 12000) {
+        historyPrefixLines = historyPrefixLines.slice(-12000);
+      }
+    }
+    lastTerminalFrame = frame;
+  }
+
+  function renderHistoryNow() {
+    historyRenderTimer = null;
+    if (!historyActive) return;
+    ensureHistoryLayer();
+    if (!historyLayer || !historyPre) return;
+    var selection = window.getSelection ? window.getSelection() : null;
+    if (selection && !selection.isCollapsed &&
+        historyLayer.contains(selection.anchorNode)) return;
+    var distanceFromBottom = Math.max(
+      0,
+      historyLayer.scrollHeight - historyLayer.scrollTop - historyLayer.clientHeight
+    );
+    historyPre.textContent = historyPrefixLines.concat(
+      lastTerminalFrame || []
+    ).join('\n');
+    if (distanceFromBottom <= rowHeight() * 1.5) {
+      historyLayer.scrollTop = historyLayer.scrollHeight;
+    } else {
+      historyLayer.scrollTop = Math.max(
+        0,
+        historyLayer.scrollHeight - historyLayer.clientHeight - distanceFromBottom
+      );
+    }
+  }
+
+  function scheduleHistoryRender() {
+    if (!historyActive || historyRenderTimer !== null) return;
+    historyRenderTimer = window.setTimeout(renderHistoryNow, 80);
+  }
+
+  function openHistoryReview() {
+    ensureHistoryLayer();
+    if (!historyLayer) return false;
+    updateHistoryFrame();
+    historyActive = true;
+    historyReviewing = true;
+    historyLayer.style.display = 'block';
+    if (historyPre) {
+      historyPre.textContent = historyPrefixLines.concat(
+        lastTerminalFrame || []
+      ).join('\n');
+    }
+    historyLayer.scrollTop = historyLayer.scrollHeight;
+    scheduleScrollReport();
+    return historyLayer.scrollHeight - historyLayer.clientHeight > 1;
+  }
+
+  window.__ubuntuSetHistory = function (text) {
+    var next = String(text || '');
+    if (next === historySource) return;
+    historySource = next;
+    historySourceLines = next ? next.replace(/\r/g, '').split('\n') : [];
+    historyPrefixLines = [];
+    lastTerminalFrame = null;
+    updateHistoryFrame();
+    if (historyActive) renderHistoryNow();
+  };
 
   function readTmuxCopyState() {
     var terminal = window.term;
@@ -1592,10 +1965,14 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
     var count = Math.abs(lines);
     var pages = allowPages ? Math.floor(count / pageSize) : 0;
     var remainder = allowPages ? count % pageSize : count;
+    var chunks = Math.floor(remainder / 6);
+    remainder = remainder % 6;
     var pageSequence = lines > 0 ? '\u001b[5~' : '\u001b[6~';
+    var chunkSequence = lines > 0 ? '\u001b[15~' : '\u001b[17~';
     var lineSequence = lines > 0 ? '\u001b[A' : '\u001b[B';
     sendTerminalData(
       repeatSequence(pageSequence, pages) +
+      repeatSequence(chunkSequence, chunks) +
       repeatSequence(lineSequence, remainder)
     );
   }
@@ -1651,6 +2028,81 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
 
   function reportScroll() {
     if (!viewport) return;
+    if (historyActive && historyLayer) {
+      var historyHeight = Math.max(12, rowHeight());
+      var historyTotal = Math.max(
+        1,
+        Math.round(historyLayer.scrollHeight / historyHeight)
+      );
+      var historyVisible = Math.max(
+        1,
+        Math.round(historyLayer.clientHeight / historyHeight)
+      );
+      var historyMaximum = Math.max(
+        0,
+        historyLayer.scrollHeight - historyLayer.clientHeight
+      );
+      var historyAtBottom =
+        historyMaximum - historyLayer.scrollTop <= historyHeight;
+      var historyFraction = historyMaximum <= 0
+        ? 1
+        : Math.max(0, Math.min(1, historyLayer.scrollTop / historyMaximum));
+      var historyViewportFraction = historyLayer.scrollHeight <= 0
+        ? 1
+        : Math.max(0, Math.min(
+            1,
+            historyLayer.clientHeight / historyLayer.scrollHeight
+          ));
+      var historyPosition = historyAtBottom
+        ? historyTotal
+        : Math.min(historyTotal, Math.max(historyVisible, Math.round(
+            (historyLayer.scrollTop + historyLayer.clientHeight) / historyHeight
+          )));
+      var historyReport = 'history:' + historyPosition + ':' + historyTotal +
+        ':' + historyVisible + ':' + historyAtBottom + ':' +
+        historyFraction.toFixed(4) + ':' + historyViewportFraction.toFixed(4);
+      if (historyReport === lastReport) return;
+      lastReport = historyReport;
+      try {
+        window.UbuntuTerminalBridge.onScroll(
+          historyPosition,
+          historyTotal,
+          historyVisible,
+          historyAtBottom,
+          historyFraction,
+          historyViewportFraction,
+          true
+        );
+      } catch (ignored) {
+      }
+      return;
+    }
+    var virtualVisible = Math.max(1, (window.term && window.term.rows) || 1);
+    var virtualTotal = historyPrefixLines.length +
+      ((lastTerminalFrame && lastTerminalFrame.length) || virtualVisible);
+    if (viewport.scrollHeight - viewport.clientHeight <= 1 &&
+        virtualTotal > virtualVisible) {
+      var virtualViewportFraction = Math.max(
+        0,
+        Math.min(1, virtualVisible / virtualTotal)
+      );
+      var virtualReport = 'virtual:' + virtualTotal + ':' + virtualVisible;
+      if (virtualReport === lastReport) return;
+      lastReport = virtualReport;
+      try {
+        window.UbuntuTerminalBridge.onScroll(
+          virtualTotal,
+          virtualTotal,
+          virtualVisible,
+          true,
+          1,
+          virtualViewportFraction,
+          false
+        );
+      } catch (ignored) {
+      }
+      return;
+    }
     var tmuxState = readTmuxCopyState();
     if (tmuxState) {
       tmuxCopyMode = true;
@@ -1731,36 +2183,32 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
     }
   }
 
+  function scheduleScrollReport() {
+    if (scrollReportTimer !== null) return;
+    scrollReportTimer = window.setTimeout(function () {
+      scrollReportTimer = null;
+      reportScroll();
+    }, 32);
+  }
+
   function handleTerminalScroll(deltaY) {
     if (!viewport) return;
-    if (tmuxCopyMode) {
+    if (historyActive && historyLayer) {
       historyReviewing = true;
-      tmuxTouchPixels += deltaY;
-      var height = Math.max(12, rowHeight());
-      var historyLines = tmuxTouchPixels > 0
-        ? Math.floor(tmuxTouchPixels / height)
-        : Math.ceil(tmuxTouchPixels / height);
-      if (historyLines !== 0) {
-        requestTmuxCopyLines(historyLines, false);
-        tmuxTouchPixels -= historyLines * height;
-      }
+      historyLayer.scrollTop -= deltaY;
+    } else if (tmuxCopyMode || tmuxCopyPending) {
+      sendTerminalData('q');
+      tmuxCopyMode = false;
+      tmuxCopyPending = false;
+      if (openHistoryReview() && historyLayer) historyLayer.scrollTop -= deltaY;
     } else if (viewport.scrollHeight - viewport.clientHeight > 1) {
       historyReviewing = true;
       viewport.scrollTop -= deltaY;
       reviewScrollTop = viewport.scrollTop;
-    } else if (sessionBackend === 'tmux') {
-      historyReviewing = true;
-      tmuxTouchPixels += deltaY;
-      var fallbackHeight = Math.max(12, rowHeight());
-      var fallbackLines = tmuxTouchPixels > 0
-        ? Math.floor(tmuxTouchPixels / fallbackHeight)
-        : Math.ceil(tmuxTouchPixels / fallbackHeight);
-      if (fallbackLines !== 0) {
-        requestTmuxCopyLines(fallbackLines, false);
-        tmuxTouchPixels -= fallbackLines * fallbackHeight;
-      }
+    } else if (openHistoryReview() && historyLayer) {
+      historyLayer.scrollTop -= deltaY;
     }
-    reportScroll();
+    scheduleScrollReport();
   }
 
   function flushPendingScroll() {
@@ -1777,7 +2225,8 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
   }
 
   function maintainReviewAnchor() {
-    if (!viewport || !historyReviewing || tmuxCopyMode || tmuxCopyPending ||
+    if (historyActive || !viewport || !historyReviewing ||
+        tmuxCopyMode || tmuxCopyPending ||
         scrollGesture || scrollbarDragging) return;
     var maximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
     var target = Math.max(0, Math.min(maximum, reviewScrollTop));
@@ -1787,10 +2236,21 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
   }
 
   function attachTerminalRenderObserver() {
-    if (terminalRenderDisposable || !window.term || !window.term.onRender) return;
+    if (!window.term || !window.term.onRender) return;
+    if (observedTerminal === window.term && terminalRenderDisposable) return;
+    if (terminalRenderDisposable && terminalRenderDisposable.dispose) {
+      try {
+        terminalRenderDisposable.dispose();
+      } catch (ignored) {
+      }
+    }
+    observedTerminal = window.term;
     terminalRenderDisposable = window.term.onRender(function () {
       window.requestAnimationFrame(function () {
+        updateHistoryFrame();
+        scheduleHistoryRender();
         maintainReviewAnchor();
+        if (selectionMode) applyTerminalSelection();
         reportScroll();
       });
     });
@@ -1800,7 +2260,28 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
     if (!viewport || rect.height <= 0) return null;
     var viewportFraction;
     var scrollFraction;
-    if (tmuxCopyMode && tmuxCopyMaximum > 0) {
+    if (historyActive && historyLayer) {
+      if (historyLayer.scrollHeight - historyLayer.clientHeight <= 1) return null;
+      viewportFraction = Math.min(
+        1,
+        historyLayer.clientHeight / historyLayer.scrollHeight
+      );
+      var historyMaxScroll = Math.max(
+        1,
+        historyLayer.scrollHeight - historyLayer.clientHeight
+      );
+      scrollFraction = Math.max(0, Math.min(
+        1,
+        historyLayer.scrollTop / historyMaxScroll
+      ));
+    } else if (viewport.scrollHeight - viewport.clientHeight <= 1 &&
+        historyPrefixLines.length > 0) {
+      var virtualRows = Math.max(1, (window.term && window.term.rows) || 1);
+      var virtualLines = historyPrefixLines.length +
+        ((lastTerminalFrame && lastTerminalFrame.length) || virtualRows);
+      viewportFraction = Math.min(1, virtualRows / virtualLines);
+      scrollFraction = 1;
+    } else if (tmuxCopyMode && tmuxCopyMaximum > 0) {
       var tmuxTotal = Math.max(1, tmuxCopyMaximum +
         ((window.term && window.term.rows) || 24));
       viewportFraction = Math.min(1,
@@ -1825,17 +2306,690 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
     };
   }
 
-  function beginTerminalPointer(event) {
-    if (event.pointerType !== 'touch' || activePointerId !== null) return;
-    markUserInteraction();
-    activePointerId = event.pointerId;
-    pointerStartX = event.clientX;
-    pointerStartY = event.clientY;
-    pointerLastY = event.clientY;
+  function clearLongPressTimer() {
+    window.clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+
+  function terminalCellAt(clientX, clientY) {
+    var terminal = window.term;
+    var screen = document.querySelector('.xterm-screen');
+    if (!terminal || !screen || !terminal.buffer || !terminal.buffer.active) {
+      return null;
+    }
+    var rect = screen.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    var column = Math.max(0, Math.min(
+      terminal.cols - 1,
+      Math.floor((clientX - rect.left) * terminal.cols / rect.width)
+    ));
+    var screenRow = Math.max(0, Math.min(
+      terminal.rows - 1,
+      Math.floor((clientY - rect.top) * terminal.rows / rect.height)
+    ));
+    return {
+      column: column,
+      row: (terminal.buffer.active.viewportY || 0) + screenRow,
+      columns: Math.max(1, terminal.cols || 1)
+    };
+  }
+
+  function selectionCellIndex(cell) {
+    return cell.row * cell.columns + cell.column;
+  }
+
+  function ensureSelectionHandles() {
+    if (!touchSurface || (selectionStartHandle && selectionEndHandle)) return;
+    function createHandle(name) {
+      var handle = document.createElement('div');
+      handle.setAttribute('data-selection-handle', name);
+      handle.style.position = 'absolute';
+      handle.style.width = '44px';
+      handle.style.height = '44px';
+      handle.style.borderRadius = '50%';
+      handle.style.background = 'transparent';
+      handle.style.boxSizing = 'border-box';
+      handle.style.zIndex = '35';
+      handle.style.display = 'none';
+      handle.style.pointerEvents = 'auto';
+      var knob = document.createElement('span');
+      knob.style.position = 'absolute';
+      knob.style.left = '11px';
+      knob.style.top = '11px';
+      knob.style.width = '22px';
+      knob.style.height = '22px';
+      knob.style.borderRadius = '50%';
+      knob.style.background = '#58c7d4';
+      knob.style.border = '2px solid rgba(255,255,255,0.9)';
+      knob.style.boxSizing = 'border-box';
+      knob.style.pointerEvents = 'none';
+      handle.appendChild(knob);
+      touchSurface.appendChild(handle);
+      return handle;
+    }
+    selectionStartHandle = createHandle('start');
+    selectionEndHandle = createHandle('end');
+    selectionToolbar = document.createElement('div');
+    selectionToolbar.setAttribute('data-terminal-selection-action', 'toolbar');
+    selectionToolbar.style.position = 'absolute';
+    selectionToolbar.style.zIndex = '38';
+    selectionToolbar.style.display = 'none';
+    selectionToolbar.style.padding = '2px 4px';
+    selectionToolbar.style.borderRadius = '8px';
+    selectionToolbar.style.background = 'rgba(42,42,42,0.94)';
+    selectionToolbar.style.boxShadow = '0 2px 8px rgba(0,0,0,0.45)';
+    function toolbarButton(label, color, action) {
+      var button = document.createElement('button');
+      button.setAttribute('data-terminal-selection-action', action);
+      button.textContent = label;
+      button.style.border = '0';
+      button.style.background = 'transparent';
+      button.style.color = color;
+      button.style.fontSize = '13px';
+      button.style.padding = '7px 10px';
+      button.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (action === 'copy') {
+          var selected = currentSelectionText();
+          if (selected) {
+            try {
+              window.UbuntuTerminalBridge.onCopySelection(selected);
+            } catch (ignored) {
+            }
+          }
+        }
+        window.__ubuntuClearSelection();
+      });
+      return button;
+    }
+    selectionToolbar.appendChild(toolbarButton('取消', '#d2d2d2', 'cancel'));
+    selectionToolbar.appendChild(toolbarButton('复制', '#72d894', 'copy'));
+    touchSurface.appendChild(selectionToolbar);
+
+    selectionMagnifier = document.createElement('div');
+    selectionMagnifier.style.position = 'absolute';
+    selectionMagnifier.style.left = '0';
+    selectionMagnifier.style.top = '0';
+    selectionMagnifier.style.zIndex = '40';
+    selectionMagnifier.style.display = 'none';
+    selectionMagnifier.style.width = '118px';
+    selectionMagnifier.style.height = '46px';
+    selectionMagnifier.style.boxSizing = 'border-box';
+    selectionMagnifier.style.overflow = 'hidden';
+    selectionMagnifier.style.whiteSpace = 'pre';
+    selectionMagnifier.style.fontFamily =
+      'serif-monospace,"Noto Sans CJK SC",sans-serif';
+    selectionMagnifier.style.fontSize = '18px';
+    selectionMagnifier.style.lineHeight = '22px';
+    selectionMagnifier.style.color = '#fff';
+    selectionMagnifier.style.background = 'rgba(35,35,35,0.96)';
+    selectionMagnifier.style.border = '1px solid rgba(255,255,255,0.7)';
+    selectionMagnifier.style.borderRadius = '10px';
+    selectionMagnifier.style.boxShadow = '0 3px 10px rgba(0,0,0,0.55)';
+    selectionMagnifier.style.willChange = 'transform';
+    function magnifierTextSide(side) {
+      var span = document.createElement('span');
+      span.style.position = 'absolute';
+      span.style.top = '50%';
+      span.style.width = '50%';
+      span.style.overflow = 'hidden';
+      span.style.transform = 'translateY(-50%)';
+      span.style.whiteSpace = 'pre';
+      if (side === 'before') {
+        span.style.right = '50%';
+        span.style.textAlign = 'right';
+        span.style.paddingRight = '3px';
+      } else {
+        span.style.left = '50%';
+        span.style.textAlign = 'left';
+        span.style.paddingLeft = '3px';
+      }
+      return span;
+    }
+    magnifierBefore = magnifierTextSide('before');
+    magnifierAfter = magnifierTextSide('after');
+    magnifierCaret = document.createElement('span');
+    magnifierCaret.style.position = 'absolute';
+    magnifierCaret.style.left = '50%';
+    magnifierCaret.style.top = '8px';
+    magnifierCaret.style.bottom = '8px';
+    magnifierCaret.style.width = '2px';
+    magnifierCaret.style.transform = 'translateX(-1px)';
+    magnifierCaret.style.background = '#58c7d4';
+    magnifierCaret.style.borderRadius = '2px';
+    magnifierCaret.style.boxShadow = '0 0 4px rgba(88,199,212,0.8)';
+    selectionMagnifier.appendChild(magnifierBefore);
+    selectionMagnifier.appendChild(magnifierAfter);
+    selectionMagnifier.appendChild(magnifierCaret);
+    touchSurface.appendChild(selectionMagnifier);
+  }
+
+  function renderMagnifierText(before, after) {
+    if (!magnifierBefore || !magnifierAfter) return;
+    magnifierBefore.textContent = String(before || '').replace(/\n/g, ' ');
+    magnifierAfter.textContent = String(after || '').replace(/\n/g, ' ');
+  }
+
+  function currentSelectionText() {
+    if (selectionKind === 'history' && historyPre &&
+        historySelectionStart !== null && historySelectionEnd !== null) {
+      var historyText = historyPre.textContent || '';
+      var historyStart = Math.min(historySelectionStart, historySelectionEnd);
+      var historyEnd = Math.max(historySelectionStart, historySelectionEnd);
+      return historyText.slice(historyStart, historyEnd + 1);
+    }
+    return window.term && window.term.getSelection
+      ? window.term.getSelection()
+      : '';
+  }
+
+  function terminalSelectionGeometry() {
+    var screen = document.querySelector('.xterm-screen');
+    var terminal = window.term;
+    if (!screen || !terminal || !touchSurface) return null;
+    var rect = screen.getBoundingClientRect();
+    var surfaceRect = touchSurface.getBoundingClientRect();
+    return {
+      terminal: terminal,
+      rect: rect,
+      surfaceRect: surfaceRect,
+      cellWidth: rect.width / Math.max(1, terminal.cols),
+      cellHeight: rect.height / Math.max(1, terminal.rows)
+    };
+  }
+
+  function positionSelectionHandle(handle, cell, atEnd, knownGeometry) {
+    var geometry = knownGeometry || terminalSelectionGeometry();
+    if (!handle || !geometry || !cell) return;
+    var terminal = geometry.terminal;
+    var rect = geometry.rect;
+    var surfaceRect = geometry.surfaceRect;
+    var viewportRow = cell.row - (terminal.buffer.active.viewportY || 0);
+    if (viewportRow < 0 || viewportRow >= terminal.rows) {
+      handle.style.display = 'none';
+      return;
+    }
+    var x = rect.left - surfaceRect.left +
+      (cell.column + (atEnd ? 1 : 0)) * geometry.cellWidth - 22;
+    var y = rect.top - surfaceRect.top +
+      (viewportRow + 1) * geometry.cellHeight - 22;
+    handle.style.left = x + 'px';
+    handle.style.top = y + 'px';
+    handle.style.display = 'block';
+  }
+
+  function positionSelectionMagnifier(clientX, clientY) {
+    if (!selectionMagnifier || !touchSurface) return;
+    var surfaceRect = touchSurface.getBoundingClientRect();
+    var width = 118;
+    var height = 46;
+    var left = clientX - surfaceRect.left - width / 2;
+    var top = clientY - surfaceRect.top - height - 34;
+    if (top < 4) top = clientY - surfaceRect.top + 30;
+    left = Math.max(4, Math.min(surfaceRect.width - width - 4, left));
+    top = Math.max(4, Math.min(surfaceRect.height - height - 4, top));
+    selectionMagnifier.style.transform =
+      'translate3d(' + left + 'px,' + top + 'px,0)';
+    selectionMagnifier.style.display = 'block';
+  }
+
+  function positionSelectionToolbar() {
+    if (!selectionToolbar || !touchSurface ||
+        !selectionAnchor || !selectionFocus) return;
+    var screen = document.querySelector('.xterm-screen');
+    var terminal = window.term;
+    if (!screen || !terminal) return;
+    var rect = screen.getBoundingClientRect();
+    var surfaceRect = touchSurface.getBoundingClientRect();
+    var first = selectionCellIndex(selectionAnchor) <= selectionCellIndex(selectionFocus)
+      ? selectionAnchor
+      : selectionFocus;
+    var last = first === selectionAnchor ? selectionFocus : selectionAnchor;
+    var firstViewportRow = first.row - (terminal.buffer.active.viewportY || 0);
+    var lastViewportRow = last.row - (terminal.buffer.active.viewportY || 0);
+    var cellWidth = rect.width / Math.max(1, terminal.cols);
+    var cellHeight = rect.height / Math.max(1, terminal.rows);
+    selectionToolbar.style.display = 'block';
+    var toolbarWidth = selectionToolbar.offsetWidth || 104;
+    var toolbarHeight = selectionToolbar.offsetHeight || 40;
+    var anchorX = rect.left - surfaceRect.left + first.column * cellWidth;
+    var above = rect.top - surfaceRect.top + firstViewportRow * cellHeight -
+      toolbarHeight - 8;
+    var below = rect.top - surfaceRect.top + (lastViewportRow + 1) * cellHeight + 16;
+    selectionToolbar.style.left = Math.max(
+      4,
+      Math.min(surfaceRect.width - toolbarWidth - 4, anchorX)
+    ) + 'px';
+    selectionToolbar.style.top = Math.max(
+      4,
+      Math.min(surfaceRect.height - toolbarHeight - 4, above >= 4 ? above : below)
+    ) + 'px';
+  }
+
+  function updateSelectionMagnifier(clientX, clientY, knownCell) {
+    ensureSelectionHandles();
+    if (!selectionMagnifier || !touchSurface) return;
+    var cell = knownCell || terminalCellAt(clientX, clientY);
+    var terminal = window.term;
+    if (!cell || !terminal || !terminal.buffer || !terminal.buffer.active) return;
+    var line = terminal.buffer.active.getLine(cell.row);
+    var before = '';
+    var after = '';
+    if (line) {
+      for (var beforeColumn = Math.max(0, cell.column - 5);
+          beforeColumn < cell.column; beforeColumn++) {
+        var beforeCell = line.getCell(beforeColumn);
+        before += beforeCell && beforeCell.getChars()
+          ? beforeCell.getChars()
+          : ' ';
+      }
+      for (var afterColumn = cell.column;
+          afterColumn < Math.min(cell.columns, cell.column + 5); afterColumn++) {
+        var afterCell = line.getCell(afterColumn);
+        after += afterCell && afterCell.getChars()
+          ? afterCell.getChars()
+          : ' ';
+      }
+    }
+    renderMagnifierText(
+      before,
+      after
+    );
+    positionSelectionMagnifier(clientX, clientY);
+  }
+
+  function historyOffsetAt(clientX, clientY) {
+    if (!historyPre || !historyPre.firstChild) return null;
+    var range = document.caretRangeFromPoint
+      ? document.caretRangeFromPoint(clientX, clientY)
+      : null;
+    if (!range || !historyPre.contains(range.startContainer)) return null;
+    var textLength = (historyPre.textContent || '').length;
+    var offset = Math.max(0, Math.min(textLength - 1, range.startOffset));
+    var text = historyPre.textContent || '';
+    if (offset > 0 && offset < text.length &&
+        text.charCodeAt(offset) >= 0xDC00 && text.charCodeAt(offset) <= 0xDFFF &&
+        text.charCodeAt(offset - 1) >= 0xD800 &&
+        text.charCodeAt(offset - 1) <= 0xDBFF) {
+      offset--;
+    }
+    return offset;
+  }
+
+  function historyCharacterRect(offset, after) {
+    if (!historyPre || !historyPre.firstChild) return null;
+    var node = historyPre.firstChild;
+    var length = node.textContent.length;
+    if (length <= 0) return null;
+    var safe = Math.max(0, Math.min(length - 1, offset));
+    var range = document.createRange();
+    range.setStart(node, safe);
+    range.setEnd(node, Math.min(length, safe + 1));
+    var rect = range.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return null;
+    return {
+      left: after ? rect.right : rect.left,
+      bottom: rect.bottom,
+      top: rect.top
+    };
+  }
+
+  function applyHistorySelection() {
+    if (!historyPre || !historyPre.firstChild ||
+        historySelectionStart === null || historySelectionEnd === null) return;
+    var node = historyPre.firstChild;
+    var length = node.textContent.length;
+    if (length <= 0) return;
+    var start = Math.max(
+      0,
+      Math.min(length - 1, Math.min(historySelectionStart, historySelectionEnd))
+    );
+    var end = Math.max(
+      start + 1,
+      Math.min(length, Math.max(historySelectionStart, historySelectionEnd) + 1)
+    );
+    var range = document.createRange();
+    range.setStart(node, start);
+    range.setEnd(node, end);
+    var selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    ensureSelectionHandles();
+    var surfaceRect = touchSurface.getBoundingClientRect();
+    function placeHistoryHandle(handle, rect) {
+      if (!handle || !rect) return;
+      handle.style.left = (rect.left - surfaceRect.left - 22) + 'px';
+      handle.style.top = (rect.bottom - surfaceRect.top - 22) + 'px';
+      handle.style.display = 'block';
+    }
+    var startRect = null;
+    var endRect = null;
+    if (selectionGesture && historySelectionStart !== historySelectionEnd) {
+      var adjustingAnchor = selectionAdjusting === 'anchor';
+      var activeOffset = adjustingAnchor
+        ? historySelectionStart
+        : historySelectionEnd;
+      var activeIsStart = adjustingAnchor
+        ? historySelectionStart <= historySelectionEnd
+        : historySelectionEnd <= historySelectionStart;
+      var activeRect = historyCharacterRect(activeOffset, !activeIsStart);
+      placeHistoryHandle(
+        activeIsStart ? selectionStartHandle : selectionEndHandle,
+        activeRect
+      );
+    } else {
+      startRect = historyCharacterRect(start, false);
+      endRect = historyCharacterRect(end - 1, true);
+      placeHistoryHandle(selectionStartHandle, startRect);
+      placeHistoryHandle(selectionEndHandle, endRect);
+    }
+    if (selectionToolbar && startRect && endRect && !selectionGesture) {
+      selectionToolbar.style.display = 'block';
+      var toolbarWidth = selectionToolbar.offsetWidth || 104;
+      var toolbarHeight = selectionToolbar.offsetHeight || 40;
+      var above = startRect.top - surfaceRect.top - toolbarHeight - 8;
+      var below = endRect.bottom - surfaceRect.top + 16;
+      selectionToolbar.style.left = Math.max(
+        4,
+        Math.min(
+          surfaceRect.width - toolbarWidth - 4,
+          startRect.left - surfaceRect.left
+        )
+      ) + 'px';
+      selectionToolbar.style.top = Math.max(
+        4,
+        Math.min(
+          surfaceRect.height - toolbarHeight - 4,
+          above >= 4 ? above : below
+        )
+      ) + 'px';
+    }
+  }
+
+  function updateHistorySelectionMagnifier(clientX, clientY, knownOffset) {
+    ensureSelectionHandles();
+    if (!selectionMagnifier || !historyPre || !touchSurface) return;
+    var offset = knownOffset === undefined
+      ? historyOffsetAt(clientX, clientY)
+      : knownOffset;
+    if (offset === null) return;
+    var text = historyPre.textContent || '';
+    renderMagnifierText(
+      text.slice(Math.max(0, offset - 5), offset),
+      text.slice(offset, Math.min(text.length, offset + 5))
+    );
+    positionSelectionMagnifier(clientX, clientY);
+  }
+
+  function startHistorySelection(clientX, clientY) {
+    var offset = historyOffsetAt(clientX, clientY);
+    if (offset === null) return;
+    var input = document.querySelector('.xterm-helper-textarea');
+    if (input) input.blur();
+    selectionMode = true;
+    selectionKind = 'history';
+    selectionGesture = true;
+    historySelectionStart = offset;
+    historySelectionEnd = offset;
+    selectionAdjusting = 'focus';
+    applyHistorySelection();
+    updateHistorySelectionMagnifier(clientX, clientY, offset);
+  }
+
+  function updateHistorySelection(clientX, clientY) {
+    var offset = historyOffsetAt(clientX, clientY);
+    if (offset === null) return;
+    if (selectionAdjusting === 'anchor') {
+      historySelectionStart = offset;
+    } else {
+      historySelectionEnd = offset;
+    }
+    applyHistorySelection();
+    updateHistorySelectionMagnifier(clientX, clientY, offset);
+  }
+
+  function applyTerminalSelection() {
+    var terminal = window.term;
+    if (!terminal || !selectionAnchor || !selectionFocus || !terminal.select) return;
+    var anchorIndex = selectionCellIndex(selectionAnchor);
+    var focusIndex = selectionCellIndex(selectionFocus);
+    var startIndex = Math.min(anchorIndex, focusIndex);
+    var endIndex = Math.max(anchorIndex, focusIndex);
+    var columns = selectionAnchor.columns;
+    terminal.select(
+      startIndex % columns,
+      Math.floor(startIndex / columns),
+      Math.max(1, endIndex - startIndex + 1)
+    );
+    ensureSelectionHandles();
+    var geometry = terminalSelectionGeometry();
+    var startsAtAnchor = anchorIndex <= focusIndex;
+    positionSelectionHandle(
+      selectionStartHandle,
+      startsAtAnchor ? selectionAnchor : selectionFocus,
+      false,
+      geometry
+    );
+    positionSelectionHandle(
+      selectionEndHandle,
+      startsAtAnchor ? selectionFocus : selectionAnchor,
+      true,
+      geometry
+    );
+    if (selectionGesture) {
+      if (selectionToolbar) selectionToolbar.style.display = 'none';
+    } else {
+      positionSelectionToolbar();
+    }
+  }
+
+  function updateTerminalSelection(clientX, clientY) {
+    var cell = terminalCellAt(clientX, clientY);
+    if (!cell || !selectionAnchor || !selectionFocus) return;
+    if (selectionAdjusting === 'anchor') {
+      selectionAnchor = cell;
+    } else {
+      selectionFocus = cell;
+    }
+    applyTerminalSelection();
+    updateSelectionMagnifier(clientX, clientY, cell);
+  }
+
+  function reportTerminalSelection() {
+    if (!selectionToolbar) return;
+    if (selectionGesture) {
+      selectionToolbar.style.display = 'none';
+      return;
+    }
+    selectionToolbar.style.display = currentSelectionText()
+      ? 'block'
+      : 'none';
+  }
+
+  function startTerminalSelection(clientX, clientY) {
+    var cell = terminalCellAt(clientX, clientY);
+    if (!cell || !window.term || !window.term.select) return;
+    var input = document.querySelector('.xterm-helper-textarea');
+    if (input) input.blur();
+    selectionMode = true;
+    selectionKind = 'terminal';
+    selectionGesture = true;
+    selectionAnchor = cell;
+    selectionFocus = cell;
+    selectionAdjusting = 'focus';
+    applyTerminalSelection();
+    updateSelectionMagnifier(clientX, clientY);
+    reportTerminalSelection();
+  }
+
+  window.__ubuntuClearSelection = function () {
+    clearLongPressTimer();
+    if (selectionMoveAnimationFrame !== null) {
+      window.cancelAnimationFrame(selectionMoveAnimationFrame);
+      selectionMoveAnimationFrame = null;
+    }
+    selectionMode = false;
+    selectionKind = null;
+    selectionGesture = false;
+    selectionAnchor = null;
+    selectionFocus = null;
+    selectionAdjusting = null;
+    historySelectionStart = null;
+    historySelectionEnd = null;
+    if (selectionStartHandle) selectionStartHandle.style.display = 'none';
+    if (selectionEndHandle) selectionEndHandle.style.display = 'none';
+    if (selectionToolbar) selectionToolbar.style.display = 'none';
+    if (selectionMagnifier) selectionMagnifier.style.display = 'none';
+    if (window.term && window.term.clearSelection) {
+      window.term.clearSelection();
+    }
+    var documentSelection = window.getSelection ? window.getSelection() : null;
+    if (documentSelection) documentSelection.removeAllRanges();
+  };
+
+  function resetTerminalTouch() {
+    clearLongPressTimer();
+    if (selectionMoveAnimationFrame !== null) {
+      window.cancelAnimationFrame(selectionMoveAnimationFrame);
+      selectionMoveAnimationFrame = null;
+    }
+    if (scrollAnimationFrame !== null) {
+      window.cancelAnimationFrame(scrollAnimationFrame);
+      flushPendingScroll();
+    }
+    if (touchSurface && activeTouchId !== null &&
+        touchSurface.hasPointerCapture &&
+        touchSurface.hasPointerCapture(activeTouchId)) {
+      try {
+        touchSurface.releasePointerCapture(activeTouchId);
+      } catch (ignored) {
+      }
+    }
+    activeTouchId = null;
     scrollGesture = false;
     scrollbarDragging = false;
+    selectionGesture = false;
     tmuxTouchPixels = 0;
     pendingScrollPixels = 0;
+  }
+
+  function flushSelectionMove() {
+    selectionMoveAnimationFrame = null;
+    if (!selectionGesture || activeTouchId === null) return;
+    if (selectionKind === 'history') {
+      updateHistorySelection(pendingSelectionX, pendingSelectionY);
+    } else {
+      updateTerminalSelection(pendingSelectionX, pendingSelectionY);
+    }
+  }
+
+  function queueSelectionMove(clientX, clientY) {
+    pendingSelectionX = clientX;
+    pendingSelectionY = clientY;
+    if (selectionMoveAnimationFrame !== null) return;
+    selectionMoveAnimationFrame = window.requestAnimationFrame(flushSelectionMove);
+  }
+
+  function beginTerminalPointer(event) {
+    if (!touchSurface || !touchSurface.contains(event.target)) return;
+    if (event.target && event.target.closest &&
+        event.target.closest('[data-terminal-selection-action]')) return;
+    // A fresh gesture must always replace stale state left by the IME, a
+    // rotation, or an old WebView that failed to deliver touchend.
+    resetTerminalTouch();
+    markUserInteraction();
+    activeTouchId = event.pointerId;
+    touchStartX = event.clientX;
+    touchStartY = event.clientY;
+    touchLastY = event.clientY;
+    pendingSelectionX = event.clientX;
+    pendingSelectionY = event.clientY;
+    if (touchSurface.setPointerCapture) {
+      try {
+        touchSurface.setPointerCapture(event.pointerId);
+      } catch (ignored) {
+      }
+    }
+
+    var targetSelectionHandle = event.target && event.target.getAttribute
+      ? event.target.getAttribute('data-selection-handle')
+      : null;
+    if (historyActive && historyLayer) {
+      if (selectionMode && selectionKind === 'history') {
+        var historyOffset = historyOffsetAt(event.clientX, event.clientY);
+        if (historyOffset === null || historySelectionStart === null ||
+            historySelectionEnd === null) return;
+        var historyRequestedHandle = targetSelectionHandle;
+        if (historyRequestedHandle === 'start') {
+          selectionAdjusting = historySelectionStart <= historySelectionEnd
+            ? 'anchor'
+            : 'focus';
+        } else if (historyRequestedHandle === 'end') {
+          selectionAdjusting = historySelectionStart <= historySelectionEnd
+            ? 'focus'
+            : 'anchor';
+        } else {
+          selectionAdjusting =
+            Math.abs(historyOffset - historySelectionStart) <=
+              Math.abs(historyOffset - historySelectionEnd)
+            ? 'anchor'
+            : 'focus';
+        }
+        selectionGesture = true;
+        if (selectionToolbar) selectionToolbar.style.display = 'none';
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      var historySurfaceRect = touchSurface.getBoundingClientRect();
+      var historyLocalX = event.clientX - historySurfaceRect.left;
+      var historyLocalY = event.clientY - historySurfaceRect.top;
+      var historyMetrics = scrollbarMetrics(historySurfaceRect);
+      if (historyMetrics && historyLocalX >= historySurfaceRect.width - 18 &&
+          historyLocalY >= historyMetrics.top - 10 &&
+          historyLocalY <= historyMetrics.top + historyMetrics.height + 10) {
+        scrollbarDragging = true;
+        scrollbarGrabOffset = Math.max(0, Math.min(
+          historyMetrics.height,
+          historyLocalY - historyMetrics.top
+        ));
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      longPressTimer = window.setTimeout(function () {
+        if (activeTouchId !== null && !scrollGesture) {
+          startHistorySelection(touchStartX, touchStartY);
+        }
+      }, 300);
+      return;
+    }
+
+    if (selectionMode) {
+      var selectionCell = terminalCellAt(event.clientX, event.clientY);
+      if (!selectionCell || !selectionAnchor || !selectionFocus) return;
+      var requestedHandle = event.target && event.target.getAttribute
+        ? event.target.getAttribute('data-selection-handle')
+        : null;
+      var anchorIndex = selectionCellIndex(selectionAnchor);
+      var focusIndex = selectionCellIndex(selectionFocus);
+      if (requestedHandle === 'start') {
+        selectionAdjusting = anchorIndex <= focusIndex ? 'anchor' : 'focus';
+      } else if (requestedHandle === 'end') {
+        selectionAdjusting = anchorIndex <= focusIndex ? 'focus' : 'anchor';
+      } else {
+        var touchedIndex = selectionCellIndex(selectionCell);
+        var anchorDistance = Math.abs(touchedIndex - anchorIndex);
+        var focusDistance = Math.abs(touchedIndex - focusIndex);
+        selectionAdjusting = anchorDistance <= focusDistance ? 'anchor' : 'focus';
+      }
+      selectionGesture = true;
+      if (selectionToolbar) selectionToolbar.style.display = 'none';
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
 
     var rect = touchSurface.getBoundingClientRect();
     var localX = event.clientX - rect.left;
@@ -1849,14 +3003,28 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
         metrics.height,
         localY - metrics.top
       ));
-      touchSurface.setPointerCapture(event.pointerId);
       event.preventDefault();
       event.stopImmediatePropagation();
+      return;
     }
+
+    if (historyActive) return;
+    longPressTimer = window.setTimeout(function () {
+      if (activeTouchId !== null && !scrollGesture && !scrollbarDragging) {
+        startTerminalSelection(touchStartX, touchStartY);
+      }
+    }, 300);
   }
 
   function moveTerminalPointer(event) {
-    if (event.pointerId !== activePointerId) return;
+    if (event.pointerId !== activeTouchId || !touchSurface) return;
+    if (selectionGesture) {
+      queueSelectionMove(event.clientX, event.clientY);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+
     var rect = touchSurface.getBoundingClientRect();
     if (scrollbarDragging) {
       var metrics = scrollbarMetrics(rect);
@@ -1875,71 +3043,120 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
       return;
     }
 
-    var deltaX = event.clientX - pointerStartX;
-    var deltaY = event.clientY - pointerStartY;
+    var deltaX = event.clientX - touchStartX;
+    var deltaY = event.clientY - touchStartY;
     if (!scrollGesture && Math.abs(deltaY) >= 8 &&
         Math.abs(deltaY) > Math.abs(deltaX)) {
+      clearLongPressTimer();
       scrollGesture = true;
-      touchSurface.setPointerCapture(event.pointerId);
+      if (window.term && window.term.clearSelection) window.term.clearSelection();
+    }
+    if (historyActive) {
+      if (scrollGesture) {
+        queueTerminalScroll(event.clientY - touchLastY);
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+      touchLastY = event.clientY;
+      return;
     }
     if (scrollGesture) {
-      queueTerminalScroll(event.clientY - pointerLastY);
+      queueTerminalScroll(event.clientY - touchLastY);
       event.preventDefault();
       event.stopImmediatePropagation();
     }
-    pointerLastY = event.clientY;
+    touchLastY = event.clientY;
   }
 
   function endTerminalPointer(event) {
-    if (event.pointerId !== activePointerId) return;
-    if (scrollAnimationFrame !== null) {
-      window.cancelAnimationFrame(scrollAnimationFrame);
-      flushPendingScroll();
+    if (event.pointerId !== activeTouchId && activeTouchId !== null &&
+        event.type !== 'pointercancel') return;
+    var handled = scrollbarDragging || selectionGesture || scrollGesture;
+    var completedSelection = selectionGesture;
+    if (completedSelection && selectionMoveAnimationFrame !== null) {
+      window.cancelAnimationFrame(selectionMoveAnimationFrame);
+      selectionMoveAnimationFrame = null;
+      flushSelectionMove();
     }
-    if (scrollGesture || scrollbarDragging) {
+    if (selectionMagnifier) selectionMagnifier.style.display = 'none';
+    resetTerminalTouch();
+    if (completedSelection) {
+      if (selectionKind === 'history') {
+        applyHistorySelection();
+      } else {
+        applyTerminalSelection();
+      }
+      reportTerminalSelection();
+    }
+    if (handled) {
       event.preventDefault();
       event.stopImmediatePropagation();
     }
-    if (touchSurface.hasPointerCapture(event.pointerId)) {
-      touchSurface.releasePointerCapture(event.pointerId);
-    }
-    activePointerId = null;
-    scrollGesture = false;
-    scrollbarDragging = false;
-    tmuxTouchPixels = 0;
     window.setTimeout(reportScroll, 20);
+  }
+
+  function installTerminalTouchHandlers() {
+    if (terminalTouchHandlersInstalled) return;
+    terminalTouchHandlersInstalled = true;
+    document.addEventListener(
+      'pointerdown', beginTerminalPointer, {capture: true, passive: false}
+    );
+    document.addEventListener(
+      'pointermove', moveTerminalPointer, {capture: true, passive: false}
+    );
+    document.addEventListener(
+      'pointerup', endTerminalPointer, {capture: true, passive: false}
+    );
+    document.addEventListener(
+      'pointercancel', endTerminalPointer, {capture: true, passive: false}
+    );
+    document.addEventListener('contextmenu', function (event) {
+      if (touchSurface && touchSurface.contains(event.target)) {
+        if (historyLayer && historyLayer.contains(event.target)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, true);
+    window.addEventListener('blur', resetTerminalTouch, true);
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) resetTerminalTouch();
+    }, true);
   }
 
   function attachViewport() {
     var found = document.querySelector('.xterm-viewport');
-    if (!found || found === viewport) return;
-    if (touchSurface) {
-      touchSurface.removeEventListener('pointerdown', beginTerminalPointer, true);
-      touchSurface.removeEventListener('pointermove', moveTerminalPointer, true);
-      touchSurface.removeEventListener('pointerup', endTerminalPointer, true);
-      touchSurface.removeEventListener('pointercancel', endTerminalPointer, true);
+    if (!found) return;
+    if (found === viewport) {
+      touchSurface = found.closest('.xterm') || found.parentElement || found;
+      return;
     }
+    resetTerminalTouch();
     viewport = found;
     touchSurface = found.closest('.xterm') || found.parentElement || found;
+    selectionStartHandle = null;
+    selectionEndHandle = null;
+    selectionToolbar = null;
+    selectionMagnifier = null;
+    magnifierBefore = null;
+    magnifierCaret = null;
+    magnifierAfter = null;
+    historyLayer = null;
+    historyPre = null;
+    historyActive = false;
+    ensureHistoryLayer();
     viewport.addEventListener('scroll', function () {
-      maintainReviewAnchor();
-      reportScroll();
+      if (historyActive) return;
+      reviewScrollTop = viewport.scrollTop;
+      var height = rowHeight();
+      historyReviewing =
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > height;
+      scheduleScrollReport();
     }, {passive: true});
-    touchSurface.addEventListener(
-      'pointerdown', beginTerminalPointer, {capture: true, passive: false}
-    );
-    touchSurface.addEventListener(
-      'pointermove', moveTerminalPointer, {capture: true, passive: false}
-    );
-    touchSurface.addEventListener(
-      'pointerup', endTerminalPointer, {capture: true, passive: false}
-    );
-    touchSurface.addEventListener(
-      'pointercancel', endTerminalPointer, {capture: true, passive: false}
-    );
     window.__ubuntuScrollToLatest = function () {
       if (!viewport) return;
       historyReviewing = false;
+      historyActive = false;
+      if (historyLayer) historyLayer.style.display = 'none';
       pendingTmuxLines = 0;
       pendingTmuxAllowPages = false;
       window.clearTimeout(tmuxCopyProbeTimer);
@@ -1957,20 +3174,23 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
       if (!viewport) return;
       historyReviewing = true;
       var safeFraction = Math.max(0, Math.min(1, Number(fraction) || 0));
-      if (tmuxCopyMode && tmuxCopyMaximum > 0) {
-        tmuxScrollTargetFraction = safeFraction;
-        window.clearTimeout(tmuxScrollTargetTimer);
-        var applyTmuxFraction = function () {
-          var targetOffset = Math.round(
-            (1 - tmuxScrollTargetFraction) * tmuxCopyMaximum
-          );
-          requestTmuxCopyLines(targetOffset - tmuxCopyOffset, true);
-          window.setTimeout(reportScroll, 80);
-        };
-        tmuxScrollTargetTimer = window.setTimeout(
-          applyTmuxFraction,
-          immediate ? 60 : 120
+      if (historyActive && historyLayer) {
+        var historyMaxScroll = Math.max(
+          0,
+          historyLayer.scrollHeight - historyLayer.clientHeight
         );
+        historyLayer.scrollTop = historyMaxScroll * safeFraction;
+        window.setTimeout(reportScroll, 20);
+        return;
+      }
+      if (viewport.scrollHeight - viewport.clientHeight <= 1 &&
+          historyPrefixLines.length > 0 && openHistoryReview()) {
+        var openedMaxScroll = Math.max(
+          0,
+          historyLayer.scrollHeight - historyLayer.clientHeight
+        );
+        historyLayer.scrollTop = openedMaxScroll * safeFraction;
+        window.setTimeout(reportScroll, 20);
         return;
       }
       var maxScroll = Math.max(
@@ -1991,12 +3211,22 @@ private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
 
   function setup() {
     clearStaleTerminalInput();
+    installTerminalTouchHandlers();
     attachViewport();
     attachTerminalRenderObserver();
+    window.setTimeout(function () {
+      if (readTmuxCopyState()) {
+        sendTerminalData('q');
+        tmuxCopyMode = false;
+        tmuxCopyPending = false;
+      }
+    }, 120);
     window.setInterval(function () {
       clearStaleTerminalInput();
       attachViewport();
       attachTerminalRenderObserver();
+      updateHistoryFrame();
+      scheduleHistoryRender();
       maintainReviewAnchor();
       reportScroll();
     }, 400);

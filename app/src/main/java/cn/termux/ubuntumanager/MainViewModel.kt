@@ -76,12 +76,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (statusMonitoringJob?.isActive == true) return
         statusMonitoringJob = viewModelScope.launch {
             while (isActive) {
-                delay(STATUS_REFRESH_INTERVAL_MILLIS)
-                if (repository.state.value.currentOperation != null) continue
-
-                if (repository.state.value.environment.ready) {
+                if (
+                    repository.state.value.currentOperation == null &&
+                    repository.state.value.environment.ready
+                ) {
                     repository.refreshRuntime()
                 }
+                delay(STATUS_REFRESH_INTERVAL_MILLIS)
             }
         }
     }
@@ -172,6 +173,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     phase = LocalSessionPhase.READY,
                     port = connection.port,
                     backend = connection.backend,
+                    historySnapshot = connection.historySnapshot,
                     message = "已连接本机后台会话",
                 )
             } catch (error: Exception) {

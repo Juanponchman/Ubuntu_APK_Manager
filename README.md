@@ -35,16 +35,17 @@ Ubuntu 24.04 / OpenSSH / tmux / ttyd / Nmap
 ├── images/      # <实例名>.img
 ├── runtime/     # PID、端口和临时挂载点
 ├── logs/        # supervisor、sshd 日志
-├── backups/     # 稀疏 ext4 备份镜像与 SHA-256
+├── backups/     # 仅兼容读取旧版 Root 私有备份
 └── cache/       # 已校验的 Ubuntu Base 下载缓存
 ```
 
 监督脚本安装在 `/data/adb/cntermux/chroot-supervisor.sh`，ARM64 原生维护工具安装在
 `/data/adb/cntermux/cntermux-sparsecopy`，负责稀疏复制和按 Chroot 根目录精确清理进程。
 实例停止后才能备份、恢复、复制、重命名或
-删除。备份直接复制 ext4 镜像的数据区，不逐个遍历或压缩实例内的小文件，也不会把镜像
-空洞扩展成真实占用；每份备份均生成 SHA-256 校验文件。复制器源码位于
-`app/src/main/cpp/sparsecopy.c`。
+删除。新备份通过原生稀疏区块归档与快速压缩直接保存到
+`内部存储/Ubuntu管理器/备份`，文件管理器可以看到并复制 `.cnubuntu` 单文件归档。
+恢复时原生工具按区块重建稀疏镜像，不会把8GB逻辑空洞展开成真实空间；归档内含
+SHA-256 和元数据。复制器源码位于 `app/src/main/cpp/sparsecopy.c`。
 
 ## 开机自动启动
 

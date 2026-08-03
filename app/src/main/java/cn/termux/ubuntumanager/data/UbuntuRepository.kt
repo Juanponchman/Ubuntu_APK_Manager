@@ -144,15 +144,43 @@ class UbuntuRepository(
                         },
                     )
                 }
+                if (_state.value.currentOperation != null) return
                 val registry = preferences.snapshot()
-                _state.update { current -> current.mergeRegistry(registry).copy(
-                    instances = instances,
-                    commandHistory = registry.commandHistory,
-                    commands = registry.commands,
-                    commandTags = registry.commandTags,
-                    terminalShortcuts = registry.terminalShortcuts,
-                    lastStatusCheckEpochMillis = System.currentTimeMillis(),
-                ) }
+                val runtimeByName = instances.associateBy { it.name }
+                _state.update { current ->
+                    val merged = current.mergeRegistry(registry)
+                    merged.copy(
+                        instances = merged.instances.map { currentInstance ->
+                            val observed = runtimeByName[currentInstance.name]
+                                ?: return@map currentInstance
+                            currentInstance.copy(
+                                hasLocalSession = observed.hasLocalSession,
+                                localSessionPort = observed.localSessionPort,
+                                hostAddress = observed.hostAddress,
+                                state = if (
+                                    currentInstance.state == InstanceRuntimeState.OPERATING
+                                ) {
+                                    InstanceRuntimeState.OPERATING
+                                } else {
+                                    observed.state
+                                },
+                                uptime = observed.uptime,
+                                message = if (
+                                    currentInstance.state == InstanceRuntimeState.OPERATING
+                                ) {
+                                    currentInstance.message
+                                } else {
+                                    observed.message
+                                },
+                            )
+                        },
+                        commandHistory = registry.commandHistory,
+                        commands = registry.commands,
+                        commandTags = registry.commandTags,
+                        terminalShortcuts = registry.terminalShortcuts,
+                        lastStatusCheckEpochMillis = System.currentTimeMillis(),
+                    )
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -198,7 +226,12 @@ class UbuntuRepository(
                 enabled = inspection.autoStart.enabled,
                 names = inspection.autoStart.instances.keys,
             )
-            val backups = if (environment.backupReady) inspection.backups else null
+            val cachedBackups = preferences.snapshot().backups
+            val backups = if (environment.backupReady) {
+                mergeBackupCatalog(inspection.backups, cachedBackups)
+            } else {
+                null
+            }
             if (backups != null) preferences.saveBackups(backups)
             val instances = readInstances(inspection.runtimes)
             var registry = preferences.snapshot()
@@ -297,6 +330,14 @@ class UbuntuRepository(
 
     private fun AppUiState.mergeRegistry(registry: RegistrySnapshot): AppUiState {
         return copy(
+            instances = instances.map { instance ->
+                instance.copy(
+                    isProtected = instance.name in registry.protectedNames,
+                    isManaged = instance.name in registry.managedNames,
+                    sshPort = registry.ports[instance.name] ?: instance.sshPort,
+                    autoStartEnabled = instance.name in registry.autoStartNames,
+                )
+            },
             backups = registry.backups,
             backgroundOperation = registry.backgroundOperation,
             hideFromRecentsWhenBackground = registry.hideFromRecentsWhenBackground,
@@ -316,7 +357,10 @@ class UbuntuRepository(
             }
             _state.update { it.copy(backupsSyncing = true) }
             try {
-                val backups = chrootClient.listBackups()
+                val backups = mergeBackupCatalog(
+                    chrootClient.listBackups(),
+                    preferences.snapshot().backups,
+                )
                 preferences.saveBackups(backups)
                 _state.update {
                     it.copy(
@@ -366,7 +410,11 @@ class UbuntuRepository(
     }
 
     suspend fun start(name: String) = runOperation(
-        OperationInfo(label = "正在启动 $name", instanceName = name),
+        OperationInfo(
+            label = "正在启动 $name",
+            instanceName = name,
+            runtimeTransition = true,
+        ),
     ) {
         val instance = requireInstance(name)
         val sessions = chrootClient.listSessions().filter { it.container == name }
@@ -394,6 +442,7 @@ class UbuntuRepository(
         OperationInfo(
             label = if (force) "正在强制停止 $name" else "正在停止 $name",
             instanceName = name,
+            runtimeTransition = true,
         ),
     ) {
         requireInstance(name)
@@ -409,7 +458,11 @@ class UbuntuRepository(
     }
 
     suspend fun restartSsh(name: String) = runOperation(
-        OperationInfo(label = "正在重启 $name 的 SSH", instanceName = name),
+        OperationInfo(
+            label = "正在重启 $name 的 SSH",
+            instanceName = name,
+            runtimeTransition = true,
+        ),
     ) {
         val instance = requireInstance(name)
         val sessions = chrootClient.listSessions().filter { it.container == name }
@@ -507,6 +560,7 @@ class UbuntuRepository(
                 return LocalSessionConnection(
                     port = existingPort,
                     backend = chrootClient.localTerminalBackend(name),
+                    historySnapshot = chrootClient.captureLocalTerminalHistory(name),
                 )
             }
         }
@@ -559,6 +613,7 @@ class UbuntuRepository(
                     return LocalSessionConnection(
                         port = selectedPort,
                         backend = chrootClient.localTerminalBackend(name),
+                        historySnapshot = chrootClient.captureLocalTerminalHistory(name),
                     )
                 }
                 delay(LOCAL_SESSION_CONNECT_DELAY_MILLIS)
@@ -673,10 +728,16 @@ class UbuntuRepository(
     suspend fun setProtection(name: String, protected: Boolean) {
         requireInstance(name)
         preferences.setProtected(name, protected)
-        _state.value = _state.value.copy(
-            lastMessage = if (protected) "$name 已重新启用保护" else "$name 已解除保护",
-        )
-        refreshRuntime()
+        reconcileCachedInstances()
+        _state.update {
+            it.copy(
+                lastMessage = if (protected) {
+                    "$name 已重新启用保护"
+                } else {
+                    "$name 已解除保护"
+                },
+            )
+        }
     }
 
     suspend fun setAutoStartEnabled(enabled: Boolean) = runOperation(
@@ -720,7 +781,11 @@ class UbuntuRepository(
     }
 
     suspend fun updateSshPort(name: String, newPort: Int) = runOperation(
-        OperationInfo(label = "正在修改 $name 的 SSH 端口", instanceName = name),
+        OperationInfo(
+            label = "正在修改 $name 的 SSH 端口",
+            instanceName = name,
+            runtimeTransition = true,
+        ),
     ) {
         val instance = requireInstance(name)
         ChrootClient.requireValidPort(newPort)
@@ -968,8 +1033,11 @@ class UbuntuRepository(
         requireInstance(name)
         val sessions = chrootClient.listSessions().filter { it.container == name }
         require(sessions.isEmpty()) { "为保证数据一致，请先停止实例再备份" }
-        chrootClient.backup(name, displayName)
-        var updatedBackups = chrootClient.listBackups()
+        val createdBackup = chrootClient.backup(name, displayName)
+        var updatedBackups = mergeBackupCatalog(
+            chrootClient.listBackups(),
+            preferences.snapshot().backups + createdBackup,
+        )
         val retentionCount = preferences.snapshot().backupRetentionCount
         var deletedCount = 0
         var cleanupError: String? = null
@@ -1006,9 +1074,11 @@ class UbuntuRepository(
     suspend fun renameBackup(backup: BackupEntry, displayName: String) = runOperation(
         OperationInfo(label = "正在修改备份名称"),
     ) {
-        val result = chrootClient.renameBackup(backup, displayName)
-        check(result.isSuccess) { result.bestError }
-        val updatedBackups = chrootClient.listBackups()
+        val renamedBackup = chrootClient.renameBackup(backup, displayName)
+        val updatedBackups = mergeBackupCatalog(
+            chrootClient.listBackups(),
+            preferences.snapshot().backups.filterNot { it.path == backup.path } + renamedBackup,
+        )
         preferences.saveBackups(updatedBackups)
         _state.value = _state.value.copy(
             backups = updatedBackups,
@@ -1184,19 +1254,73 @@ class UbuntuRepository(
         block: suspend () -> String,
     ): OperationOutcome {
         return operationMutex.withLock {
-            _state.value = _state.value.copy(currentOperation = operation, lastMessage = null)
+            val previousInstance = operation.instanceName?.let { targetName ->
+                _state.value.instances.firstOrNull { it.name == targetName }
+            }
+            _state.update { current ->
+                current.copy(
+                    currentOperation = operation,
+                    lastMessage = null,
+                    instances = if (operation.runtimeTransition) {
+                        current.instances.map { instance ->
+                            if (instance.name == operation.instanceName) {
+                                instance.copy(
+                                    state = InstanceRuntimeState.OPERATING,
+                                    message = operation.label,
+                                )
+                            } else {
+                                instance
+                            }
+                        }
+                    } else {
+                        current.instances
+                    },
+                )
+            }
             val result = try {
                 OperationOutcome(succeeded = true, message = block())
             } catch (cancelled: CancellationException) {
-                _state.value = _state.value.copy(
-                    currentOperation = null,
-                    lastMessage = "${operation.label}已中断，重新操作前请先检查实例状态",
-                )
+                _state.update { current ->
+                    current.copy(
+                        currentOperation = null,
+                        lastMessage = "${operation.label}已中断，重新操作前请先检查实例状态",
+                        instances = if (operation.runtimeTransition) {
+                            current.instances.map { instance ->
+                                if (instance.name == operation.instanceName) {
+                                    instance.copy(
+                                        state = InstanceRuntimeState.UNKNOWN,
+                                        message = "操作已中断，请刷新确认实际状态",
+                                    )
+                                } else {
+                                    instance
+                                }
+                            }
+                        } else {
+                            current.instances
+                        },
+                    )
+                }
                 throw cancelled
             } catch (error: Exception) {
                 OperationOutcome(
                     succeeded = false,
                     message = "操作失败：${error.userMessage()}",
+                )
+            }
+            val targetName = operation.instanceName
+            if (
+                operation.runtimeTransition &&
+                targetName != null &&
+                _state.value.instances.any { it.name == targetName } &&
+                targetName !in runtimeStateHints
+            ) {
+                hintRuntimeState(
+                    targetName,
+                    if (result.succeeded) {
+                        previousInstance?.state ?: InstanceRuntimeState.UNKNOWN
+                    } else {
+                        InstanceRuntimeState.UNKNOWN
+                    },
                 )
             }
             _state.value = _state.value.copy(
@@ -1280,6 +1404,26 @@ class UbuntuRepository(
 
     private fun hintRuntimeState(name: String, state: InstanceRuntimeState) {
         runtimeStateHints[name] = state
+    }
+
+    private fun mergeBackupCatalog(
+        scanned: List<BackupEntry>,
+        cached: List<BackupEntry>,
+    ): List<BackupEntry> {
+        val cachedByPath = cached.associateBy { it.path }
+        return scanned.map { entry ->
+            val previous = cachedByPath[entry.path]
+            if (previous == null || previous.portableArchive != entry.portableArchive) {
+                entry
+            } else {
+                entry.copy(
+                    displayName = previous.displayName,
+                    logicalSizeBytes = entry.logicalSizeBytes.takeIf { it > 0 }
+                        ?: previous.logicalSizeBytes,
+                    metadataPresent = entry.metadataPresent || previous.metadataPresent,
+                )
+            }
+        }.sortedByDescending { it.modifiedEpochSeconds }
     }
 
     private suspend fun rememberRootPassword(name: String, password: String): String? = try {

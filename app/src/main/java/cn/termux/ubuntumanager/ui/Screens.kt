@@ -846,7 +846,13 @@ fun InstanceDetailScreen(
                         enabled = false,
                         modifier = Modifier.weight(1f),
                     ) {
-                        Text("状态未知")
+                        Text(
+                            if (instance.state == InstanceRuntimeState.OPERATING) {
+                                "操作中"
+                            } else {
+                                "状态未知"
+                            },
+                        )
                     }
                 }
             }
@@ -872,7 +878,7 @@ fun InstanceDetailScreen(
             }
             Text(
                 if (stopped) {
-                    "实例已停止，可以安全备份或复制。"
+                    "实例已停止，可以直接生成文件管理器可见的压缩备份。"
                 } else {
                     "必须先手动停止实例，运行中不会自动关机或开始备份。"
                 },
@@ -1164,7 +1170,9 @@ private fun BackupNameDialog(
                         }
                     },
                     label = { Text("备份名称") },
-                    supportingText = { Text(error ?: "名称可随时修改，不影响镜像文件") },
+                    supportingText = {
+                        Text(error ?: "保存到内部存储/Ubuntu管理器/备份")
+                    },
                     isError = error != null,
                     singleLine = true,
                 )
@@ -1663,7 +1671,8 @@ fun BackupsScreen(
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Text(
-                            "每份备份只包含一个 Ubuntu 实例的 ext4 镜像，不包含管理器或外部存储。",
+                            "新备份直接保存为文件管理器可见的 .cnubuntu；" +
+                                "将同格式文件复制到备份目录后刷新即可导入。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -1721,7 +1730,11 @@ fun BackupsScreen(
         ConfirmDialog(
             title = "删除 ${backup.displayName}？",
             message = "${backup.fileName}\n${formatBytes(backup.sizeBytes)}\n\n" +
-                "备份镜像、SHA-256 和名称元数据都会被永久删除，此操作无法恢复。",
+                if (backup.portableArchive) {
+                    "内部存储中的可见压缩包将被永久删除，此操作无法恢复。"
+                } else {
+                    "旧版备份镜像、SHA-256 和名称元数据都会被永久删除，此操作无法恢复。"
+                },
             confirmText = "永久删除",
             dangerous = true,
             onDismiss = { deleteCandidate = null },
@@ -1792,7 +1805,11 @@ private fun BackupCard(
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
-                "实际占用 ${formatBytes(backup.sizeBytes)}" +
+                "${if (backup.portableArchive) {
+                    "内部存储压缩包"
+                } else {
+                    "旧版 Root 稀疏备份"
+                }} · 实际占用 ${formatBytes(backup.sizeBytes)}" +
                     if (backup.logicalSizeBytes > 0) {
                         " · 容量 ${formatBytes(backup.logicalSizeBytes)}"
                     } else {
@@ -2559,7 +2576,7 @@ fun SettingsScreen(
                 if (state.environment.autoStartReady) "Alpha service.d 已安装" else "未安装",
             )
             InfoRow("实例模式", "独立 ext4 镜像 · 共享宿主网络")
-            InfoRow("备份目录", if (state.environment.backupReady) "Root 私有目录可用" else "不可用")
+            InfoRow("备份目录", if (state.environment.backupReady) "内部存储目录可用" else "不可用")
             OutlinedButton(
                 onClick = onRequestAlphaSetup,
                 enabled = !alphaSetupInProgress,
@@ -2609,10 +2626,11 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            InfoRow("备份格式", "稀疏 ext4 镜像 + SHA-256")
-            InfoRow("备份位置", "/data/local/cntermux/backups")
+            InfoRow("备份格式", ".cnubuntu 单文件压缩归档")
+            InfoRow("备份位置", "内部存储/Ubuntu管理器/备份")
             Text(
-                "备份由 Alpha Root 直接复制停止状态下的实例镜像，不需要 Termux 存储授权或目录链接。",
+                "备份由 Alpha Root 从停止状态实例生成可见压缩包；恢复时通过原生工具" +
+                    "重建稀疏镜像，不依赖 Termux。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

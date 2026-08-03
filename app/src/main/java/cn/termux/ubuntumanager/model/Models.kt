@@ -111,11 +111,13 @@ data class BackupEntry(
     val displayName: String = instanceName,
     val logicalSizeBytes: Long = 0,
     val metadataPresent: Boolean = false,
+    val portableArchive: Boolean = false,
 )
 
 data class OperationInfo(
     val label: String,
     val instanceName: String? = null,
+    val runtimeTransition: Boolean = false,
 )
 
 enum class BackgroundOperationType {
@@ -216,6 +218,7 @@ enum class LocalSessionBackend {
 data class LocalSessionConnection(
     val port: Int,
     val backend: LocalSessionBackend,
+    val historySnapshot: String = "",
 )
 
 data class LocalSessionState(
@@ -223,6 +226,7 @@ data class LocalSessionState(
     val phase: LocalSessionPhase = LocalSessionPhase.IDLE,
     val port: Int? = null,
     val backend: LocalSessionBackend = LocalSessionBackend.UNKNOWN,
+    val historySnapshot: String = "",
     val message: String? = null,
 ) {
     val url: String?
