@@ -419,7 +419,14 @@ class ChrootClient(
             ?: return failure("本地会话端口记录无效")
         val compatibility = executeScript(
             name,
-            "pid=\$(cat /run/cntermux/ttyd.pid 2>/dev/null || true); " +
+            "mkdir -p /etc/profile.d; " +
+                "printf '%s\\n' 'export LANG=C.UTF-8' 'export LC_ALL=C.UTF-8' " +
+                "> /etc/profile.d/cntermux-locale.sh; " +
+                "chmod 644 /etc/profile.d/cntermux-locale.sh; " +
+                "if tmux has-session -t cntermux 2>/dev/null; then " +
+                "tmux set-environment -g LANG C.UTF-8; " +
+                "tmux set-environment -g LC_ALL C.UTF-8; fi; " +
+                "pid=\$(cat /run/cntermux/ttyd.pid 2>/dev/null || true); " +
                 "[ -n \"\${pid}\" ] || exit 1; " +
                 "tr '\\000' '\\n' < /proc/\${pid}/environ 2>/dev/null; " +
                 "printf '%s\\n' ---CMD---; " +
@@ -443,7 +450,8 @@ class ChrootClient(
             (
                 compatibility.stdout.contains("fontFamily=serif-monospace") ||
                     compatibility.stdout.contains("fontFamily serif-monospace")
-            )
+            ) &&
+            compatibility.stdout.contains("tmux -u new-session")
         ) {
             return success("ALREADY_COMPATIBLE")
         }
@@ -461,15 +469,24 @@ class ChrootClient(
         val script = """
             set -eu
             mkdir -p /run/cntermux /var/log/cntermux
+            mkdir -p /etc/profile.d
+            printf '%s\n' 'export LANG=C.UTF-8' 'export LC_ALL=C.UTF-8' \
+              >/etc/profile.d/cntermux-locale.sh
+            chmod 644 /etc/profile.d/cntermux-locale.sh
+            if tmux has-session -t cntermux 2>/dev/null; then
+              tmux set-environment -g LANG C.UTF-8
+              tmux set-environment -g LC_ALL C.UTF-8
+            fi
             if [ -f /run/cntermux/ttyd.pid ] && kill -0 "${'$'}(cat /run/cntermux/ttyd.pid)" 2>/dev/null; then
               exit 0
             fi
-            nohup setsid ttyd -W -i 127.0.0.1 -p $port \
+            nohup setsid env LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+              ttyd -W -i 127.0.0.1 -p $port \
               -t rendererType=canvas \
               -t fontSize=10 \
               -t letterSpacing=0 \
               -t 'fontFamily=serif-monospace,Noto Sans CJK SC,sans-serif' \
-              tmux new-session -A -s cntermux \
+              tmux -u new-session -A -s cntermux \
               >/var/log/cntermux/ttyd.log 2>&1 </dev/null &
             printf '%s\n' "${'$'}!" >/run/cntermux/ttyd.pid
         """.trimIndent()

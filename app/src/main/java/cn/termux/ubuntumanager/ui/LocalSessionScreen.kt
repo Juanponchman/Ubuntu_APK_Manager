@@ -10,16 +10,22 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.text.Editable
 import android.text.InputType
 import android.text.Selection
-import android.text.SpannableStringBuilder
+import android.util.Log
+import android.util.TypedValue
+import android.view.ActionMode
+import android.view.Gravity
 import android.view.KeyEvent
+import android.view.Menu
+import android.view.MenuItem
+import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputConnectionWrapper
 import android.view.inputmethod.InputMethodManager
-import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
@@ -27,6 +33,9 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
@@ -137,6 +146,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONObject
+import org.json.JSONTokener
 
 @Composable
 fun LocalSessionScreen(
@@ -214,8 +224,15 @@ fun LocalSessionScreen(
         webView.evaluateJavascript(
             "window.__ubuntuSendRaw && window.__ubuntuSendRaw(" +
                 JSONObject.quote(text) + ");",
-            null,
-        )
+        ) { result ->
+            if (cn.termux.ubuntumanager.BuildConfig.DEBUG) {
+                Log.d(
+                    "CnTerminalIme",
+                    "terminalSend=$result chars=${text.length} " +
+                        "nonAscii=${text.any { it.code > 127 }}",
+                )
+            }
+        }
     }
 
     fun sendTerminalKey(
@@ -285,6 +302,12 @@ fun LocalSessionScreen(
     }
 
     fun sendKeyStroke(stroke: TerminalKeyStroke) {
+        if (
+            stroke.key == TerminalKeys.ESCAPE &&
+            terminalWebView?.dismissNativeSelection(resumeInput = true) == true
+        ) {
+            return
+        }
         val option = TerminalKeys.option(stroke.key) ?: return
         val ctrlActive = stroke.ctrl || ctrlMode != TerminalModifierMode.OFF
         val altActive = stroke.alt || altMode != TerminalModifierMode.OFF
@@ -966,61 +989,102 @@ private fun TerminalScrollbar(
 
 private class TerminalInputWebView(context: Context) : WebView(context) {
     var onNativeInput: ((String, String) -> Unit)? = null
+    var onDismissNativeSelection: ((Boolean) -> Boolean)? = null
     var appliedPageState: String? = null
+    var inputProxy: TerminalImeEditText? = null
 
     private var ctrlActive = false
     private var altActive = false
     private var released = false
-    private val editorBuffer = SpannableStringBuilder().apply {
-        Selection.setSelection(this, 0)
-    }
 
     fun updateModifiers(ctrlActive: Boolean, altActive: Boolean) {
         if (this.ctrlActive == ctrlActive && this.altActive == altActive) return
         this.ctrlActive = ctrlActive
         this.altActive = altActive
-        BaseInputConnection.removeComposingSpans(editorBuffer)
-        restartTerminalInput(clearHelper = true)
+        evaluateJavascript(
+            "window.__ubuntuResetImeAfterModifier && " +
+                "window.__ubuntuResetImeAfterModifier();",
+            null,
+        )
+        inputProxy?.setModifierInputActive(ctrlActive || altActive)
     }
+
+    fun dismissNativeSelection(resumeInput: Boolean): Boolean =
+        onDismissNativeSelection?.invoke(resumeInput) == true
 
     fun releaseTerminal() {
         if (released) return
         released = true
+        onDismissNativeSelection = null
         stopLoading()
         removeJavascriptInterface(TERMINAL_BRIDGE_NAME)
         destroy()
     }
+}
 
-    override fun onCheckIsTextEditor(): Boolean = true
+private class TerminalImeEditText(context: Context) : EditText(context) {
+    var onTerminalInput: ((String, String) -> Unit)? = null
 
-    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
-            InputType.TYPE_TEXT_FLAG_MULTI_LINE or
-            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-        outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or
+    private var deletingInCodePoints = false
+    private var modifierInputActive = false
+    private var modifierRestartPending = false
+
+    init {
+        setRawInputType(TEXT_INPUT_TYPE)
+        imeOptions = EditorInfo.IME_ACTION_NONE or
             EditorInfo.IME_FLAG_NO_EXTRACT_UI or
             EditorInfo.IME_FLAG_NO_FULLSCREEN or
             EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
-        outAttrs.initialSelStart = Selection.getSelectionStart(editorBuffer)
-        outAttrs.initialSelEnd = Selection.getSelectionEnd(editorBuffer)
-        return object : BaseInputConnection(this@TerminalInputWebView, true) {
-            private var deletingInCodePoints = false
+        isSingleLine = false
+        isFocusable = true
+        isFocusableInTouchMode = true
+        setTextColor(android.graphics.Color.TRANSPARENT)
+        setHintTextColor(android.graphics.Color.TRANSPARENT)
+        setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        isCursorVisible = false
+        setPadding(0, 0, 0, 0)
+        importantForAutofill = IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        alpha = 0.02f
+        contentDescription = "终端输入代理"
+    }
 
-            override fun getEditable(): Editable = editorBuffer
-
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+        val base = super.onCreateInputConnection(outAttrs) ?: return null
+        val modifierGate = TerminalModifierInputGate()
+        return object : InputConnectionWrapper(base, false) {
             override fun setComposingText(
                 text: CharSequence?,
                 newCursorPosition: Int,
-            ): Boolean = super.setComposingText(text ?: "", newCursorPosition)
+            ): Boolean {
+                if (!modifierGate.intercepts(modifierInputActive)) {
+                    return super.setComposingText(text, newCursorPosition)
+                }
+                modifierInputCharacter(text?.toString().orEmpty())?.let { value ->
+                    if (modifierGate.consume(modifierInputActive, value) != null) {
+                        dispatchTerminalInput(value, "ime-modifier-compose")
+                        scheduleModifierInputRestart()
+                    }
+                }
+                return true
+            }
 
             override fun commitText(
                 text: CharSequence?,
                 newCursorPosition: Int,
             ): Boolean {
                 val value = text?.toString().orEmpty()
-                val accepted = super.commitText(text ?: "", newCursorPosition)
-                if (value.isNotEmpty()) {
-                    dispatchImeInput(
+                if (modifierGate.intercepts(modifierInputActive)) {
+                    val normalized = modifierInputCharacter(value)
+                        ?: if (value == "\n") "\r" else value
+                    if (modifierGate.consume(modifierInputActive, normalized) != null) {
+                        dispatchTerminalInput(normalized, "ime-modifier-commit")
+                        scheduleModifierInputRestart()
+                    }
+                    return true
+                }
+                val accepted = super.commitText(text, newCursorPosition)
+                if (accepted && value.isNotEmpty()) {
+                    dispatchTerminalInput(
                         if (value == "\n") "\r" else value,
                         "ime-commit",
                     )
@@ -1033,7 +1097,12 @@ private class TerminalInputWebView(context: Context) : WebView(context) {
                 val value = terminalValueFor(event)
                 if (value == null) return super.sendKeyEvent(event)
                 if (event.action == KeyEvent.ACTION_DOWN) {
-                    dispatchImeInput(value, "ime-key-event")
+                    if (!modifierGate.intercepts(modifierInputActive)) {
+                        dispatchTerminalInput(value, "ime-key-event")
+                    } else if (modifierGate.consume(modifierInputActive, value) != null) {
+                        dispatchTerminalInput(value, "ime-modifier-key-event")
+                        scheduleModifierInputRestart()
+                    }
                 }
                 return true
             }
@@ -1042,13 +1111,16 @@ private class TerminalInputWebView(context: Context) : WebView(context) {
                 beforeLength: Int,
                 afterLength: Int,
             ): Boolean {
+                if (modifierGate.intercepts(modifierInputActive)) {
+                    val value = deletionValue(beforeLength, afterLength)
+                    if (modifierGate.consume(modifierInputActive, value) != null) {
+                        dispatchTerminalInput(value, "ime-modifier-delete")
+                        scheduleModifierInputRestart()
+                    }
+                    return true
+                }
                 if (!deletingInCodePoints && !hasComposingText()) {
-                    if (beforeLength > 0) {
-                        dispatchImeInput("\u007f".repeat(beforeLength), "ime-delete")
-                    }
-                    if (afterLength > 0) {
-                        dispatchImeInput("\u001b[3~".repeat(afterLength), "ime-delete")
-                    }
+                    dispatchDeletion(beforeLength, afterLength, "ime-delete")
                 }
                 return super.deleteSurroundingText(beforeLength, afterLength)
             }
@@ -1057,16 +1129,20 @@ private class TerminalInputWebView(context: Context) : WebView(context) {
                 beforeLength: Int,
                 afterLength: Int,
             ): Boolean {
+                if (modifierGate.intercepts(modifierInputActive)) {
+                    val value = deletionValue(beforeLength, afterLength)
+                    if (modifierGate.consume(modifierInputActive, value) != null) {
+                        dispatchTerminalInput(value, "ime-modifier-delete-codepoint")
+                        scheduleModifierInputRestart()
+                    }
+                    return true
+                }
                 if (!hasComposingText()) {
-                    if (beforeLength > 0) {
-                        dispatchImeInput("\u007f".repeat(beforeLength), "ime-delete-codepoint")
-                    }
-                    if (afterLength > 0) {
-                        dispatchImeInput(
-                            "\u001b[3~".repeat(afterLength),
-                            "ime-delete-codepoint",
-                        )
-                    }
+                    dispatchDeletion(
+                        beforeLength,
+                        afterLength,
+                        "ime-delete-codepoint",
+                    )
                 }
                 deletingInCodePoints = true
                 return try {
@@ -1077,7 +1153,12 @@ private class TerminalInputWebView(context: Context) : WebView(context) {
             }
 
             override fun performEditorAction(actionCode: Int): Boolean {
-                dispatchImeInput("\r", "ime-editor-action")
+                if (!modifierGate.intercepts(modifierInputActive)) {
+                    dispatchTerminalInput("\r", "ime-editor-action")
+                } else if (modifierGate.consume(modifierInputActive, "\r") != null) {
+                    dispatchTerminalInput("\r", "ime-modifier-editor-action")
+                    scheduleModifierInputRestart()
+                }
                 return true
             }
 
@@ -1094,11 +1175,52 @@ private class TerminalInputWebView(context: Context) : WebView(context) {
                 if (value.isNotEmpty()) commitText(value, 1)
                 return true
             }
-
-            private fun hasComposingText(): Boolean =
-                BaseInputConnection.getComposingSpanStart(editorBuffer) >= 0
         }
     }
+
+    fun setModifierInputActive(active: Boolean) {
+        if (modifierInputActive == active) return
+        modifierInputActive = active
+        setRawInputType(if (active) MODIFIER_INPUT_TYPE else TEXT_INPUT_TYPE)
+        resetTerminalInput(clearBuffer = true)
+    }
+
+    private fun resetTerminalInput(clearBuffer: Boolean) {
+        val editable = text
+        BaseInputConnection.removeComposingSpans(editable)
+        if (clearBuffer) {
+            editable?.clear()
+            Selection.setSelection(editable, 0)
+        }
+        val inputManager =
+            context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        inputManager.restartInput(this)
+    }
+
+    private fun scheduleModifierInputRestart() {
+        if (modifierRestartPending) return
+        modifierRestartPending = true
+        post {
+            modifierRestartPending = false
+            if (modifierInputActive) resetTerminalInput(clearBuffer = true)
+        }
+    }
+
+    private fun hasComposingText(): Boolean =
+        BaseInputConnection.getComposingSpanStart(text) >= 0
+
+    private fun dispatchDeletion(beforeLength: Int, afterLength: Int, source: String) {
+        dispatchTerminalInput(deletionValue(beforeLength, afterLength), source)
+    }
+
+    private fun deletionValue(beforeLength: Int, afterLength: Int): String =
+        buildString {
+            if (beforeLength > 0) append("\u007f".repeat(beforeLength))
+            if (afterLength > 0) append("\u001b[3~".repeat(afterLength))
+        }
+
+    private fun modifierInputCharacter(value: String): String? =
+        value.firstOrNull { it.code in 32..126 }?.toString()
 
     private fun terminalValueFor(event: KeyEvent): String? = when (event.keyCode) {
         KeyEvent.KEYCODE_ENTER,
@@ -1121,37 +1243,494 @@ private class TerminalInputWebView(context: Context) : WebView(context) {
             ?.let { String(Character.toChars(it)) }
     }
 
-    private fun dispatchImeInput(value: String, source: String) {
+    private fun dispatchTerminalInput(value: String, source: String) {
         if (value.isEmpty()) return
-        post { onNativeInput?.invoke(value, source) }
+        if (cn.termux.ubuntumanager.BuildConfig.DEBUG) {
+            Log.d(
+                TERMINAL_IME_LOG_TAG,
+                "source=$source chars=${value.length} " +
+                    "codePoints=${value.codePointCount(0, value.length)} " +
+                    "nonAscii=${value.any { it.code > 127 }}",
+            )
+        }
+        post { onTerminalInput?.invoke(value, source) }
     }
 
     private fun trimEditorBuffer() {
-        if (editorBuffer.length <= MAX_EDITOR_BUFFER_CHARS) return
-        if (BaseInputConnection.getComposingSpanStart(editorBuffer) >= 0) return
-        editorBuffer.delete(0, editorBuffer.length - RETAINED_EDITOR_BUFFER_CHARS)
-        Selection.setSelection(editorBuffer, editorBuffer.length)
-    }
-
-    private fun restartTerminalInput(clearHelper: Boolean) {
-        val action = {
-            if (clearHelper) {
-                evaluateJavascript(
-                    "window.__ubuntuResetImeAfterModifier && " +
-                        "window.__ubuntuResetImeAfterModifier();",
-                    null,
-                )
-            }
-            val inputManager =
-                context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            inputManager.restartInput(this)
-        }
-        post(action)
+        val editable = text ?: return
+        if (editable.length <= MAX_EDITOR_BUFFER_CHARS) return
+        if (BaseInputConnection.getComposingSpanStart(editable) >= 0) return
+        editable.delete(0, editable.length - RETAINED_EDITOR_BUFFER_CHARS)
+        Selection.setSelection(editable, editable.length)
     }
 
     private companion object {
+        const val TEXT_INPUT_TYPE = InputType.TYPE_CLASS_TEXT or
+            InputType.TYPE_TEXT_VARIATION_SHORT_MESSAGE or
+            InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        const val MODIFIER_INPUT_TYPE = InputType.TYPE_CLASS_TEXT or
+            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         const val MAX_EDITOR_BUFFER_CHARS = 512
         const val RETAINED_EDITOR_BUFFER_CHARS = 128
+        const val TERMINAL_IME_LOG_TAG = "CnTerminalIme"
+    }
+}
+
+private class TerminalHostView(context: Context) : FrameLayout(context) {
+    val terminal = TerminalInputWebView(context)
+    private val inputProxy = TerminalImeEditText(context)
+
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+    private var touchDownAt = 0L
+    private var longPressTask: Runnable? = null
+    private var nativeSelectionRequested = false
+    private var selectionOverlay: TerminalSelectionTextView? = null
+
+    init {
+        setBackgroundColor(android.graphics.Color.BLACK)
+        terminal.isFocusable = false
+        terminal.isFocusableInTouchMode = false
+        addView(
+            terminal,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT),
+        )
+        addView(
+            inputProxy,
+            LayoutParams(2, 2, Gravity.START or Gravity.BOTTOM),
+        )
+        terminal.inputProxy = inputProxy
+        terminal.onDismissNativeSelection = ::dismissNativeSelection
+        inputProxy.onTerminalInput = { value, source ->
+            terminal.onNativeInput?.invoke(value, source)
+        }
+        terminal.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    cancelLongPressDetection()
+                    nativeSelectionRequested = false
+                    touchDownX = event.x
+                    touchDownY = event.y
+                    touchDownAt = event.eventTime
+                    scheduleNativeSelection()
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val moved = kotlin.math.hypot(
+                        event.x - touchDownX,
+                        event.y - touchDownY,
+                    )
+                    if (moved >= INPUT_TAP_SLOP_PX) cancelLongPressDetection()
+                }
+                MotionEvent.ACTION_UP -> {
+                    cancelLongPressDetection()
+                    val elapsed = event.eventTime - touchDownAt
+                    val moved = kotlin.math.hypot(
+                        event.x - touchDownX,
+                        event.y - touchDownY,
+                    )
+                    if (
+                        !nativeSelectionRequested &&
+                        elapsed < INPUT_TAP_TIMEOUT_MILLIS &&
+                        moved < INPUT_TAP_SLOP_PX
+                    ) {
+                        post { requestTerminalInput() }
+                    }
+                }
+                MotionEvent.ACTION_CANCEL -> cancelLongPressDetection()
+            }
+            false
+        }
+    }
+
+    fun requestTerminalInput() {
+        terminal.evaluateJavascript(
+            "(function(){" +
+                "var active=document.activeElement;" +
+                "if(active&&active.blur){active.blur();}" +
+                "var helper=document.querySelector('.xterm-helper-textarea');" +
+                "if(helper&&helper.blur){helper.blur();}" +
+                "return true;" +
+                "})();",
+        ) {
+            post {
+                terminal.clearFocus()
+                inputProxy.requestFocusFromTouch()
+                inputProxy.setSelection(inputProxy.text?.length ?: 0)
+                val inputManager =
+                    context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                inputManager.restartInput(inputProxy)
+                inputManager.showSoftInput(inputProxy, InputMethodManager.SHOW_IMPLICIT)
+            }
+        }
+    }
+
+    fun releaseTerminal() {
+        cancelLongPressDetection()
+        selectionOverlay?.releaseSelection()
+        selectionOverlay = null
+        terminal.onDismissNativeSelection = null
+        inputProxy.onTerminalInput = null
+        terminal.releaseTerminal()
+        removeAllViews()
+    }
+
+    private fun scheduleNativeSelection() {
+        val task = Runnable {
+            longPressTask = null
+            nativeSelectionRequested = true
+            val now = SystemClock.uptimeMillis()
+            val cancelEvent = MotionEvent.obtain(
+                touchDownAt,
+                now,
+                MotionEvent.ACTION_CANCEL,
+                touchDownX,
+                touchDownY,
+                0,
+            )
+            terminal.dispatchTouchEvent(cancelEvent)
+            cancelEvent.recycle()
+            terminal.evaluateJavascript(
+                "window.__ubuntuSelectionSnapshot && " +
+                    "window.__ubuntuSelectionSnapshot();",
+            ) { encoded ->
+                val snapshot = parseSelectionSnapshot(encoded)
+                if (nativeSelectionRequested && snapshot.text.isNotEmpty()) {
+                    showNativeSelection(snapshot, touchDownX, touchDownY)
+                }
+            }
+        }
+        longPressTask = task
+        postDelayed(task, NATIVE_SELECTION_LONG_PRESS_MILLIS)
+    }
+
+    private fun cancelLongPressDetection() {
+        longPressTask?.let(::removeCallbacks)
+        longPressTask = null
+    }
+
+    private fun dismissNativeSelection(resumeInput: Boolean): Boolean {
+        val overlay = selectionOverlay ?: return false
+        overlay.requestExit(resumeInput)
+        return true
+    }
+
+    private fun parseSelectionSnapshot(encoded: String): TerminalSelectionSnapshot {
+        return runCatching {
+            val value = JSONTokener(encoded).nextValue()
+            when (value) {
+                is JSONObject -> TerminalSelectionSnapshot(
+                    text = value.optString("text"),
+                    prefixLines = value.optInt("prefixLines", 0).coerceAtLeast(0),
+                    viewportRows = value.optInt("viewportRows", 1).coerceAtLeast(1),
+                    columns = value.optInt("columns", 1).coerceAtLeast(1),
+                )
+                is String -> TerminalSelectionSnapshot(text = value)
+                else -> TerminalSelectionSnapshot()
+            }
+        }.getOrDefault(TerminalSelectionSnapshot())
+    }
+
+    private fun showNativeSelection(
+        snapshot: TerminalSelectionSnapshot,
+        x: Float,
+        y: Float,
+    ) {
+        selectionOverlay?.let { existing ->
+            existing.releaseSelection()
+            removeView(existing)
+        }
+        val overlay = TerminalSelectionTextView(context) { view, resumeInput ->
+            post {
+                if (selectionOverlay === view) {
+                    view.releaseSelection()
+                    removeView(view)
+                    selectionOverlay = null
+                    nativeSelectionRequested = false
+                    if (resumeInput) {
+                        post { requestTerminalInput() }
+                    } else {
+                        inputProxy.clearFocus()
+                        val inputManager = context.getSystemService(
+                            Context.INPUT_METHOD_SERVICE,
+                        ) as InputMethodManager
+                        inputManager.hideSoftInputFromWindow(windowToken, 0)
+                    }
+                }
+            }
+        }
+        selectionOverlay = overlay
+        addView(
+            overlay,
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT),
+        )
+        overlay.setTerminalText(snapshot)
+        overlay.postDelayed({ overlay.beginSelectionAt(x, y) }, 120L)
+    }
+
+    private companion object {
+        const val INPUT_TAP_TIMEOUT_MILLIS = 320L
+        const val INPUT_TAP_SLOP_PX = 24f
+        const val NATIVE_SELECTION_LONG_PRESS_MILLIS = 360L
+    }
+}
+
+private data class TerminalSelectionSnapshot(
+    val text: String = "",
+    val prefixLines: Int = 0,
+    val viewportRows: Int = 1,
+    val columns: Int = 1,
+)
+
+private class TerminalSelectionTextView(
+    context: Context,
+    private val onSelectionFinished: (TerminalSelectionTextView, Boolean) -> Unit,
+) : TextView(context) {
+    private var snapshot = TerminalSelectionSnapshot()
+    private var terminalMetricsApplied = false
+    private var selectionActionMode: ActionMode? = null
+    private var selectionActionModeGeneration = 0
+    private var pendingActionModeDestroy: Runnable? = null
+    private val selectionLifecycle = TerminalSelectionLifecycle()
+    private val actionModeGeneration = TerminalActionModeGeneration()
+    private val exitGesture = TerminalSelectionExitGesture(
+        ViewConfiguration.get(context).scaledTouchSlop.toFloat(),
+    )
+
+    init {
+        setBackgroundColor(android.graphics.Color.rgb(42, 42, 42))
+        setTextColor(android.graphics.Color.rgb(242, 242, 242))
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+        typeface = android.graphics.Typeface.MONOSPACE
+        includeFontPadding = false
+        setLineSpacing(0f, 1f)
+        setPadding(2, 2, 5, 2)
+        setHorizontallyScrolling(false)
+        hyphenationFrequency = android.text.Layout.HYPHENATION_FREQUENCY_NONE
+        isVerticalScrollBarEnabled = true
+        scrollBarStyle = SCROLLBARS_INSIDE_OVERLAY
+        setTextIsSelectable(true)
+        val actionModeCallback = object : ActionMode.Callback {
+            override fun onCreateActionMode(mode: ActionMode?, menu: Menu?): Boolean {
+                cancelPendingActionModeDestroy()
+                selectionActionMode = mode
+                selectionActionModeGeneration = actionModeGeneration.onCreated()
+                selectionLifecycle.activate()
+                menu?.add(Menu.NONE, SELECTION_CANCEL_MENU_ID, Menu.NONE, "取消")
+                    ?.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+                logSelectionLifecycle(
+                    "create generation=$selectionActionModeGeneration " +
+                        "mode=${mode?.let(System::identityHashCode)}",
+                )
+                return true
+            }
+
+            override fun onPrepareActionMode(mode: ActionMode?, menu: Menu?): Boolean = false
+
+            override fun onActionItemClicked(mode: ActionMode?, item: MenuItem?): Boolean {
+                if (item?.itemId == SELECTION_CANCEL_MENU_ID) {
+                    finishSelection(resumeInput = false)
+                    return true
+                }
+                return false
+            }
+
+            override fun onDestroyActionMode(mode: ActionMode?) {
+                if (selectionActionMode !== mode) return
+                selectionActionMode = null
+                val destroyedGeneration = selectionActionModeGeneration
+                if (!actionModeGeneration.onDestroyed(destroyedGeneration)) return
+                if (!selectionLifecycle.isActive) return
+                logSelectionLifecycle(
+                    "destroy generation=$destroyedGeneration; waiting for replacement",
+                )
+                scheduleActionModeDestroyCheck(destroyedGeneration)
+            }
+        }
+        customSelectionActionModeCallback = actionModeCallback
+        customInsertionActionModeCallback = actionModeCallback
+    }
+
+    fun setTerminalText(value: TerminalSelectionSnapshot) {
+        snapshot = value
+        terminalMetricsApplied = false
+        setText(value.text, BufferType.SPANNABLE)
+    }
+
+    override fun onTextContextMenuItem(id: Int): Boolean {
+        val handled = super.onTextContextMenuItem(id)
+        if (handled && id == android.R.id.copy) {
+            postDelayed({ finishSelection(resumeInput = false) }, 120L)
+        }
+        return handled
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (selectionLifecycle.isActive) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> exitGesture.start(
+                    x = event.x,
+                    y = event.y,
+                    outsideSelection = !isPointInsideSelection(event.x, event.y),
+                )
+                MotionEvent.ACTION_MOVE -> exitGesture.move(event.x, event.y)
+                MotionEvent.ACTION_CANCEL -> exitGesture.cancel()
+            }
+        }
+        val handled = super.onTouchEvent(event)
+        if (
+            selectionLifecycle.isActive &&
+            event.actionMasked == MotionEvent.ACTION_UP &&
+            exitGesture.finish(event.x, event.y)
+        ) {
+            post { finishSelection(resumeInput = true) }
+        }
+        return handled
+    }
+
+    override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_ESCAPE) {
+            if (event.action == KeyEvent.ACTION_UP) finishSelection(resumeInput = true)
+            return true
+        }
+        return super.onKeyPreIme(keyCode, event)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_ESCAPE) {
+            finishSelection(resumeInput = true)
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight)
+        applyTerminalMetrics(width, height)
+    }
+
+    private fun applyTerminalMetrics(width: Int, height: Int) {
+        if (terminalMetricsApplied || width <= 0 || height <= 0) return
+        val contentWidth = (width - paddingLeft - paddingRight).coerceAtLeast(1)
+        val targetCellWidth = contentWidth.toFloat() / snapshot.columns
+        val referenceSizePx = 24f
+        paint.textSize = referenceSizePx
+        val referenceCellWidth = paint.measureText("M").coerceAtLeast(1f)
+        setTextSize(
+            TypedValue.COMPLEX_UNIT_PX,
+            referenceSizePx * targetCellWidth / referenceCellWidth,
+        )
+        val targetRowHeight = height.toFloat() / snapshot.viewportRows
+        setLineSpacing(targetRowHeight - paint.fontSpacing, 1f)
+        terminalMetricsApplied = true
+        post {
+            scrollTo(
+                0,
+                (snapshot.prefixLines * targetRowHeight).toInt().coerceAtLeast(0),
+            )
+        }
+    }
+
+    fun beginSelectionAt(x: Float, y: Float) {
+        if (text.isEmpty()) return
+        if (!isLaidOut || width <= 0 || height <= 0 || layout == null) {
+            postDelayed({ beginSelectionAt(x, y) }, 32L)
+            return
+        }
+        requestFocus()
+        val now = SystemClock.uptimeMillis()
+        val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
+        dispatchTouchEvent(down)
+        down.recycle()
+        val handled = performLongClick(x, y)
+        val up = MotionEvent.obtain(now, now, MotionEvent.ACTION_UP, x, y, 0)
+        dispatchTouchEvent(up)
+        up.recycle()
+        if (cn.termux.ubuntumanager.BuildConfig.DEBUG) {
+            Log.d(
+                "CnTerminalSelection",
+                "handled=$handled point=${x.toInt()},${y.toInt()} " +
+                    "size=${width}x${height} lines=${layout?.lineCount ?: 0} " +
+                    "selection=$selectionStart..$selectionEnd",
+            )
+        }
+        if (handled) {
+            selectionLifecycle.activate()
+        } else {
+            post { finishSelection(resumeInput = false) }
+        }
+    }
+
+    fun requestExit(resumeInput: Boolean) {
+        finishSelection(resumeInput)
+    }
+
+    fun releaseSelection() {
+        cancelPendingActionModeDestroy()
+        selectionLifecycle.release()
+        exitGesture.cancel()
+        val mode = selectionActionMode
+        selectionActionMode = null
+        mode?.finish()
+    }
+
+    private fun finishSelection(resumeInput: Boolean) {
+        val finishResumeInput = selectionLifecycle.requestExit(resumeInput) ?: return
+        dispatchSelectionFinished(finishResumeInput)
+    }
+
+    private fun dispatchSelectionFinished(resumeInput: Boolean) {
+        cancelPendingActionModeDestroy()
+        val mode = selectionActionMode
+        selectionActionMode = null
+        mode?.finish()
+        onSelectionFinished(this, resumeInput)
+    }
+
+    private fun scheduleActionModeDestroyCheck(destroyedGeneration: Int) {
+        cancelPendingActionModeDestroy()
+        val task = Runnable {
+            pendingActionModeDestroy = null
+            if (!actionModeGeneration.isStillDestroyed(destroyedGeneration)) return@Runnable
+            logSelectionLifecycle("final destroy generation=$destroyedGeneration")
+            selectionLifecycle.onActionModeDestroyed(
+                resumeInput = true,
+            )?.let(::dispatchSelectionFinished)
+        }
+        pendingActionModeDestroy = task
+        postDelayed(task, SELECTION_ACTION_MODE_DESTROY_GRACE_MILLIS)
+    }
+
+    private fun cancelPendingActionModeDestroy() {
+        pendingActionModeDestroy?.let(::removeCallbacks)
+        pendingActionModeDestroy = null
+    }
+
+    private fun logSelectionLifecycle(message: String) {
+        if (cn.termux.ubuntumanager.BuildConfig.DEBUG) {
+            Log.d("CnTerminalSelection", message)
+        }
+    }
+
+    private fun isPointInsideSelection(x: Float, y: Float): Boolean {
+        val textLayout = layout ?: return false
+        val start = selectionStart.coerceAtLeast(0)
+        val end = selectionEnd.coerceAtLeast(0)
+        if (start == end) return false
+        val selectionMin = minOf(start, end)
+        val selectionMax = maxOf(start, end)
+        val vertical = (y - totalPaddingTop + scrollY).roundToInt()
+        if (vertical !in 0 until textLayout.height) return false
+        val line = textLayout.getLineForVertical(vertical)
+        val horizontal = x - totalPaddingLeft + scrollX
+        val offset = textLayout.getOffsetForHorizontal(line, horizontal)
+        return offset in selectionMin until selectionMax
+    }
+
+    private companion object {
+        const val SELECTION_CANCEL_MENU_ID = 0x434E5458
+        const val SELECTION_ACTION_MODE_DESTROY_GRACE_MILLIS = 360L
     }
 }
 
@@ -1206,11 +1785,8 @@ private fun LocalTerminalWebView(
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { context ->
-                TerminalInputWebView(context).apply {
-                    layoutParams = ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                    )
+                TerminalHostView(context).apply {
+                    terminal.apply {
                     setBackgroundColor(Color.Black.toArgb())
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
@@ -1299,9 +1875,11 @@ private fun LocalTerminalWebView(
                     }
                     onWebViewReady(this)
                     loadUrl(url)
+                    }
                 }
             },
-            update = { view ->
+            update = { host ->
+                val view = host.terminal
                 if (view.url != url) view.loadUrl(url)
                 val stateScript = terminalPageStateScript(
                     ctrlMode,
@@ -1318,8 +1896,8 @@ private fun LocalTerminalWebView(
                     view.appliedPageState = stateScript
                 }
             },
-            onRelease = { view ->
-                view.releaseTerminal()
+            onRelease = { host ->
+                host.releaseTerminal()
             },
         )
     }
@@ -1506,12 +2084,13 @@ body {
   };
 
   function sendTerminalData(value) {
-    if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) return;
+    if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) return false;
     var encoded = new TextEncoder().encode(value);
     var message = new Uint8Array(encoded.length + 1);
     message[0] = 48;
     message.set(encoded, 1);
     nativeWebSocketSend.call(terminalSocket, message);
+    return true;
   }
   window.__ubuntuSendRaw = sendTerminalData;
 
@@ -1930,6 +2509,25 @@ body {
     lastTerminalFrame = null;
     updateHistoryFrame();
     if (historyActive) renderHistoryNow();
+  };
+
+  window.__ubuntuSelectionSnapshot = function () {
+    updateHistoryFrame();
+    if (historyActive && historyPre) {
+      return {
+        text: historyPre.textContent || '',
+        prefixLines: 0,
+        viewportRows: Math.max(1, (window.term && window.term.rows) || 1),
+        columns: Math.max(1, (window.term && window.term.cols) || 1)
+      };
+    }
+    var frame = lastTerminalFrame || readTerminalFrame() || [];
+    return {
+      text: historyPrefixLines.concat(frame).join('\n'),
+      prefixLines: historyPrefixLines.length,
+      viewportRows: Math.max(1, (window.term && window.term.rows) || frame.length || 1),
+      columns: Math.max(1, (window.term && window.term.cols) || 1)
+    };
   };
 
   function readTmuxCopyState() {
@@ -2905,12 +3503,6 @@ body {
     touchLastY = event.clientY;
     pendingSelectionX = event.clientX;
     pendingSelectionY = event.clientY;
-    if (touchSurface.setPointerCapture) {
-      try {
-        touchSurface.setPointerCapture(event.pointerId);
-      } catch (ignored) {
-      }
-    }
 
     var targetSelectionHandle = event.target && event.target.getAttribute
       ? event.target.getAttribute('data-selection-handle')
@@ -2954,15 +3546,16 @@ body {
           historyMetrics.height,
           historyLocalY - historyMetrics.top
         ));
+        if (touchSurface.setPointerCapture) {
+          try {
+            touchSurface.setPointerCapture(event.pointerId);
+          } catch (ignored) {
+          }
+        }
         event.preventDefault();
         event.stopImmediatePropagation();
         return;
       }
-      longPressTimer = window.setTimeout(function () {
-        if (activeTouchId !== null && !scrollGesture) {
-          startHistorySelection(touchStartX, touchStartY);
-        }
-      }, 300);
       return;
     }
 
@@ -3003,17 +3596,18 @@ body {
         metrics.height,
         localY - metrics.top
       ));
+      if (touchSurface.setPointerCapture) {
+        try {
+          touchSurface.setPointerCapture(event.pointerId);
+        } catch (ignored) {
+        }
+      }
       event.preventDefault();
       event.stopImmediatePropagation();
       return;
     }
 
     if (historyActive) return;
-    longPressTimer = window.setTimeout(function () {
-      if (activeTouchId !== null && !scrollGesture && !scrollbarDragging) {
-        startTerminalSelection(touchStartX, touchStartY);
-      }
-    }, 300);
   }
 
   function moveTerminalPointer(event) {
@@ -3049,6 +3643,12 @@ body {
         Math.abs(deltaY) > Math.abs(deltaX)) {
       clearLongPressTimer();
       scrollGesture = true;
+      if (touchSurface.setPointerCapture) {
+        try {
+          touchSurface.setPointerCapture(event.pointerId);
+        } catch (ignored) {
+        }
+      }
       if (window.term && window.term.clearSelection) window.term.clearSelection();
     }
     if (historyActive) {
@@ -3110,13 +3710,6 @@ body {
     document.addEventListener(
       'pointercancel', endTerminalPointer, {capture: true, passive: false}
     );
-    document.addEventListener('contextmenu', function (event) {
-      if (touchSurface && touchSurface.contains(event.target)) {
-        if (historyLayer && historyLayer.contains(event.target)) return;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      }
-    }, true);
     window.addEventListener('blur', resetTerminalTouch, true);
     document.addEventListener('visibilitychange', function () {
       if (document.hidden) resetTerminalTouch();
