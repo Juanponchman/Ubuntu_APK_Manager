@@ -1,0 +1,74 @@
+name: Android Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable tag, for example v2.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish signed release APK
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Build, sign, and verify release APK
+        id: package
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: scripts/ci/package-android.sh release "${{ inputs.release_tag }}"
+
+      - name: Preserve release build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: UbuntuManager-${{ inputs.release_tag }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/*.apk dist/*.apk.sha256 --clobber
+            gh release edit "$RELEASE_TAG" --latest
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/*.apk dist/*.apk.sha256 \
+              --verify-tag \
+              --generate-notes \
+              --title "Ubuntu APK Manager $RELEASE_TAG" \
+              --latest
+          fi

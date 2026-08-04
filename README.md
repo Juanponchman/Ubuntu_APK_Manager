@@ -4,6 +4,20 @@
 运行时不依赖 Termux、`RUN_COMMAND` 或 `proot-distro`，由 APK 直接通过 Alpha Root
 管理 Ubuntu 实例。
 
+## 下载
+
+- [下载最新 ARM64 APK](https://github.com/sqmxhd/Ubuntu_APK_Manager/releases/latest/download/UbuntuManager-latest-arm64-v8a.apk)
+- [查看全部正式版本与 SHA-256](https://github.com/sqmxhd/Ubuntu_APK_Manager/releases)
+
+正式版本由手动触发的 GitHub Actions 使用固定 Release 密钥签名，同时提供
+`UbuntuManager-latest-arm64-v8a.apk` 和带版本号的 APK。当前仅支持 ARM64 设备。
+
+## 界面预览
+
+| 实例管理 | 实例详情与主要操作 |
+| :---: | :---: |
+| ![Root Chroot 实例列表](docs/images/instances.jpg) | ![Ubuntu 实例详情与主要操作](docs/images/instance-details.jpg) |
+
 ## 架构
 
 ```text
@@ -28,6 +42,24 @@ Ubuntu 24.04 / OpenSSH / tmux / ttyd / Nmap
 - 本地会话由实例内的 `ttyd + tmux` 提供；离开页面不会结束 tmux 会话，再次进入可继续。
 - Chroot 是运行环境，不是安全沙箱。实例内的 `root` 是设备上的真实 Root，只应运行可信程序。
 
+## 本地会话与输入法
+
+本地会话内置可配置的终端快捷键和指令库，可以直接发送 `Ctrl`、`Alt`、方向键、组合键
+或自定义命令。快捷键支持启用、禁用、改名、重新排序和编辑按键内容。
+
+目标真机已验证豆包输入法的语音转文字、剪贴板拆词选词以及删除键清空操作；输入法组合文本
+和选区替换会按 Android IME 状态同步到终端。
+
+| Root Chroot 本地终端 | 豆包输入法真机验证 |
+| :---: | :---: |
+| ![带有终端快捷键的本地会话](docs/images/local-terminal.jpg) | ![豆包输入法在本地终端中输入](docs/images/doubao-ime.jpg) |
+
+<p align="center">
+  <img src="docs/images/terminal-shortcuts.jpg" width="360" alt="终端快捷键配置">
+  <br>
+  <sub>终端快捷键可以逐项启用、编辑和调整顺序</sub>
+</p>
+
 ## 实例与备份目录
 
 ```text
@@ -47,6 +79,12 @@ Ubuntu 24.04 / OpenSSH / tmux / ttyd / Nmap
 恢复时原生工具按区块重建稀疏镜像，不会把8GB逻辑空洞展开成真实空间；归档内含
 SHA-256 和元数据。复制器源码位于 `app/src/main/cpp/sparsecopy.c`。
 
+<p align="center">
+  <img src="docs/images/backups.jpg" width="360" alt="实例备份与恢复列表">
+  <br>
+  <sub>文件管理器可见的 .cnubuntu 备份、实际占用空间和 SHA-256 校验状态</sub>
+</p>
+
 ## 开机自动启动
 
 - 设置页提供总开关，每个实例的高级设置提供独立开关。
@@ -55,6 +93,12 @@ SHA-256 和元数据。复制器源码位于 `app/src/main/cpp/sparsecopy.c`。
 - 已运行实例返回 `ALREADY_RUNNING`，不会创建第二套挂载或监督进程。
 - 开机阶段只启动 Chroot 和 SSH；`ttyd + tmux` 在进入本地会话时按需启动。
 - 启动日志位于 `/data/local/cntermux/logs/boot.log`，超过 1MB 时保留一份旧日志。
+
+<p align="center">
+  <img src="docs/images/background-protection.jpg" width="360" alt="后台运行保护设置">
+  <br>
+  <sub>后台运行保护、开机自动启动与最近后台维护任务状态</sub>
+</p>
 
 ## 新建实例
 
@@ -81,6 +125,11 @@ Root Chroot 实例与旧数据没有交叉。
 ```bash
 ./gradlew test assembleDebug
 ```
+
+仓库同时提供纯手动运行的 GitLab Docker Runner 与 GitHub Actions 工作流。日常构建在
+`main` 分支生成 latest 产物；正式发布使用与 `versionName` 一致的不可变 `vX.Y.Z` Tag，
+自动完成测试、Lint、Release 签名、签名验证和 SHA-256 生成。Release keystore 只通过
+CI Secrets 注入，不保存在 Git 中。详细配置与操作见 [CI 打包与发布](docs/CI_RELEASE.md)。
 
 最低 Android 8（API 26），当前 APK 面向 ARM64，目标设备验证环境为 Redmi K20 Pro /
 Android 11 / Magisk Alpha。

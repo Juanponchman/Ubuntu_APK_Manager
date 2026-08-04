@@ -4,6 +4,21 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val releaseKeystorePath = providers.environmentVariable("ANDROID_KEYSTORE_PATH").orNull
+val releaseKeystorePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").orNull
+val releaseSigningConfigured = listOf(
+    releaseKeystorePath,
+    releaseKeystorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { !it.isNullOrBlank() }
+
+if (providers.environmentVariable("CI_RELEASE_BUILD").orNull == "true" && !releaseSigningConfigured) {
+    error("Release signing environment is incomplete")
+}
+
 android {
     namespace = "cn.termux.ubuntumanager"
     compileSdk = 35
@@ -24,10 +39,22 @@ android {
         }
     }
 
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",

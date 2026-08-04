@@ -1,5 +1,7 @@
 *.iml
 .gradle/
+.gradle-ci/
+.kotlin/
 .idea/
 local.properties
 build/
@@ -8,3 +10,20 @@ captures/
 .cxx/
 app/build/
 
+# Local captures are kept outside the published documentation assets.
+截图/
+
+# Build and release outputs belong in CI artifacts / Releases.
+dist/
+*.apk
+*.aab
+mapping.txt
+
+# Release signing material must never be committed.
+*.jks
+*.keystore
+*.p12
+keystore.properties
+signing.properties
+.env
+*.log

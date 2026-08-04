@@ -1,0 +1,49 @@
+name: Android Latest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-latest
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build signed latest APK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Build, sign, and verify latest APK
+        id: package
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: scripts/ci/package-android.sh latest
+
+      - name: Upload latest build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: UbuntuManager-latest-v${{ steps.package.outputs.version_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
