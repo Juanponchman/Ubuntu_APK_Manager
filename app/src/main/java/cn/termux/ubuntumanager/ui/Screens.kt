@@ -1222,6 +1222,102 @@ private fun InfoRow(label: String, value: String) {
 }
 
 @Composable
+private fun BackgroundOperationSummary(
+    label: String,
+    status: BackgroundOperationStatus,
+    message: String?,
+) {
+    val statusLabel: String
+    val statusContainerColor: Color
+    val statusContentColor: Color
+    when (status) {
+        BackgroundOperationStatus.RUNNING -> {
+            statusLabel = "运行中"
+            statusContainerColor = MaterialTheme.colorScheme.primaryContainer
+            statusContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+        }
+        BackgroundOperationStatus.SUCCEEDED -> {
+            statusLabel = "已完成"
+            statusContainerColor = MaterialTheme.colorScheme.tertiaryContainer
+            statusContentColor = MaterialTheme.colorScheme.onTertiaryContainer
+        }
+        BackgroundOperationStatus.FAILED -> {
+            statusLabel = "失败"
+            statusContainerColor = MaterialTheme.colorScheme.errorContainer
+            statusContentColor = MaterialTheme.colorScheme.onErrorContainer
+        }
+        BackgroundOperationStatus.INTERRUPTED -> {
+            statusLabel = "已中断，需检查"
+            statusContainerColor = MaterialTheme.colorScheme.errorContainer
+            statusContentColor = MaterialTheme.colorScheme.onErrorContainer
+        }
+    }
+
+    val normalizedMessage = message?.trim()?.takeIf { it.isNotEmpty() }
+    val taskName = label.removePrefix("正在").ifBlank { label }
+    val primaryText = when (status) {
+        BackgroundOperationStatus.RUNNING -> label
+        BackgroundOperationStatus.SUCCEEDED -> normalizedMessage ?: "$taskName 已完成"
+        BackgroundOperationStatus.FAILED,
+        BackgroundOperationStatus.INTERRUPTED,
+        -> taskName
+    }
+    val detailText = when (status) {
+        BackgroundOperationStatus.FAILED,
+        BackgroundOperationStatus.INTERRUPTED,
+        -> normalizedMessage?.takeUnless { it == primaryText }
+        BackgroundOperationStatus.RUNNING,
+        BackgroundOperationStatus.SUCCEEDED,
+        -> null
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                RoundedCornerShape(12.dp),
+            )
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "最近后台任务",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                statusLabel,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Medium,
+                color = statusContentColor,
+                modifier = Modifier
+                    .background(statusContainerColor, RoundedCornerShape(50))
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
+        Text(
+            primaryText,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.Medium,
+        )
+        detailText?.let { detail ->
+            Text(
+                detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+    }
+}
+
+@Composable
 private fun ConfirmDialog(
     title: String,
     message: String,
@@ -2486,27 +2582,11 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             state.backgroundOperation?.let { operation ->
-                val status = when (operation.status) {
-                    BackgroundOperationStatus.RUNNING -> "运行中"
-                    BackgroundOperationStatus.SUCCEEDED -> "已完成"
-                    BackgroundOperationStatus.FAILED -> "失败"
-                    BackgroundOperationStatus.INTERRUPTED -> "已中断，需检查"
-                }
-                InfoRow("最近后台任务", "${operation.label} · $status")
-                operation.message?.let { message ->
-                    Text(
-                        message,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (
-                            operation.status == BackgroundOperationStatus.FAILED ||
-                            operation.status == BackgroundOperationStatus.INTERRUPTED
-                        ) {
-                            MaterialTheme.colorScheme.error
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                    )
-                }
+                BackgroundOperationSummary(
+                    label = operation.label,
+                    status = operation.status,
+                    message = operation.message,
+                )
             }
             Text(
                 "系统要求可靠后台维护任务保持可见通知；任务中断后不会自动重复破坏性操作。",

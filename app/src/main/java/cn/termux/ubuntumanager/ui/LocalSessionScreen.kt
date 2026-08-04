@@ -327,6 +327,9 @@ fun LocalSessionScreen(
         }
         if (ctrlMode == TerminalModifierMode.ONCE) ctrlMode = TerminalModifierMode.OFF
         if (altMode == TerminalModifierMode.ONCE) altMode = TerminalModifierMode.OFF
+        if (stroke.key == TerminalKeys.ENTER) {
+            terminalWebView?.resetInputLine()
+        }
     }
 
     LaunchedEffect(pendingKeyActionId, pageLoading, terminalWebView) {
@@ -1012,6 +1015,10 @@ private class TerminalInputWebView(context: Context) : WebView(context) {
     fun dismissNativeSelection(resumeInput: Boolean): Boolean =
         onDismissNativeSelection?.invoke(resumeInput) == true
 
+    fun resetInputLine() {
+        inputProxy?.resetInputLine()
+    }
+
     fun releaseTerminal() {
         if (released) return
         released = true
@@ -1028,6 +1035,7 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
     private var deletingInCodePoints = false
     private var modifierInputActive = false
     private var modifierRestartPending = false
+    private var inputLineResetPending = false
 
     init {
         setRawInputType(TEXT_INPUT_TYPE)
@@ -1051,14 +1059,20 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
         val base = super.onCreateInputConnection(outAttrs) ?: return null
         val modifierGate = TerminalModifierInputGate()
+        val compositionTracker = TerminalImeCompositionTracker()
         return object : InputConnectionWrapper(base, false) {
             override fun setComposingText(
                 text: CharSequence?,
                 newCursorPosition: Int,
             ): Boolean {
                 if (!modifierGate.intercepts(modifierInputActive)) {
-                    return super.setComposingText(text, newCursorPosition)
+                    val accepted = super.setComposingText(text, newCursorPosition)
+                    if (accepted) {
+                        compositionTracker.update(currentComposingText())
+                    }
+                    return accepted
                 }
+                compositionTracker.clear()
                 modifierInputCharacter(text?.toString().orEmpty())?.let { value ->
                     if (modifierGate.consume(modifierInputActive, value) != null) {
                         dispatchTerminalInput(value, "ime-modifier-compose")
@@ -1068,12 +1082,36 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                 return true
             }
 
+            override fun finishComposingText(): Boolean {
+                if (modifierGate.intercepts(modifierInputActive)) {
+                    compositionTracker.clear()
+                    return super.finishComposingText()
+                }
+                val finalValue = currentComposingText()
+                val accepted = super.finishComposingText()
+                if (accepted) {
+                    compositionTracker.finish(
+                        value = finalValue,
+                        timestamp = SystemClock.uptimeMillis(),
+                    )?.let { value ->
+                        dispatchTerminalInput(
+                            if (value == "\n") "\r" else value,
+                            "ime-compose-finish",
+                        )
+                        if (value == "\n" || value == "\r") resetInputLine()
+                    }
+                    trimEditorBuffer()
+                }
+                return accepted
+            }
+
             override fun commitText(
                 text: CharSequence?,
                 newCursorPosition: Int,
             ): Boolean {
                 val value = text?.toString().orEmpty()
                 if (modifierGate.intercepts(modifierInputActive)) {
+                    compositionTracker.clear()
                     val normalized = modifierInputCharacter(value)
                         ?: if (value == "\n") "\r" else value
                     if (modifierGate.consume(modifierInputActive, normalized) != null) {
@@ -1082,13 +1120,27 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                     }
                     return true
                 }
+                val selectedSuffixCodePoints = selectedSuffixCodePointCount()
                 val accepted = super.commitText(text, newCursorPosition)
-                if (accepted && value.isNotEmpty()) {
+                if (accepted && selectedSuffixCodePoints > 0) {
+                    dispatchTerminalInput(
+                        "\u007f".repeat(selectedSuffixCodePoints),
+                        "ime-selection-replace",
+                    )
+                }
+                if (
+                    accepted &&
+                    compositionTracker.shouldDispatchCommit(
+                        value = value,
+                        timestamp = SystemClock.uptimeMillis(),
+                    )
+                ) {
                     dispatchTerminalInput(
                         if (value == "\n") "\r" else value,
                         "ime-commit",
                     )
                 }
+                if (accepted && (value == "\n" || value == "\r")) resetInputLine()
                 trimEditorBuffer()
                 return accepted
             }
@@ -1103,6 +1155,7 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                         dispatchTerminalInput(value, "ime-modifier-key-event")
                         scheduleModifierInputRestart()
                     }
+                    if (value == "\r") resetInputLine()
                 }
                 return true
             }
@@ -1111,8 +1164,16 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                 beforeLength: Int,
                 afterLength: Int,
             ): Boolean {
+                val bounded = boundedDeletion(
+                    beforeLength = beforeLength,
+                    afterLength = afterLength,
+                    lengthsAreCodePoints = false,
+                )
                 if (modifierGate.intercepts(modifierInputActive)) {
-                    val value = deletionValue(beforeLength, afterLength)
+                    val value = deletionValue(
+                        bounded.terminalBeforeCodePoints,
+                        bounded.terminalAfterCodePoints,
+                    )
                     if (modifierGate.consume(modifierInputActive, value) != null) {
                         dispatchTerminalInput(value, "ime-modifier-delete")
                         scheduleModifierInputRestart()
@@ -1120,17 +1181,28 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                     return true
                 }
                 if (!deletingInCodePoints && !hasComposingText()) {
-                    dispatchDeletion(beforeLength, afterLength, "ime-delete")
+                    dispatchDeletion(bounded, "ime-delete")
                 }
-                return super.deleteSurroundingText(beforeLength, afterLength)
+                return super.deleteSurroundingText(
+                    bounded.connectionBeforeLength,
+                    bounded.connectionAfterLength,
+                )
             }
 
             override fun deleteSurroundingTextInCodePoints(
                 beforeLength: Int,
                 afterLength: Int,
             ): Boolean {
+                val bounded = boundedDeletion(
+                    beforeLength = beforeLength,
+                    afterLength = afterLength,
+                    lengthsAreCodePoints = true,
+                )
                 if (modifierGate.intercepts(modifierInputActive)) {
-                    val value = deletionValue(beforeLength, afterLength)
+                    val value = deletionValue(
+                        bounded.terminalBeforeCodePoints,
+                        bounded.terminalAfterCodePoints,
+                    )
                     if (modifierGate.consume(modifierInputActive, value) != null) {
                         dispatchTerminalInput(value, "ime-modifier-delete-codepoint")
                         scheduleModifierInputRestart()
@@ -1138,15 +1210,14 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                     return true
                 }
                 if (!hasComposingText()) {
-                    dispatchDeletion(
-                        beforeLength,
-                        afterLength,
-                        "ime-delete-codepoint",
-                    )
+                    dispatchDeletion(bounded, "ime-delete-codepoint")
                 }
                 deletingInCodePoints = true
                 return try {
-                    super.deleteSurroundingTextInCodePoints(beforeLength, afterLength)
+                    super.deleteSurroundingTextInCodePoints(
+                        bounded.connectionBeforeLength,
+                        bounded.connectionAfterLength,
+                    )
                 } finally {
                     deletingInCodePoints = false
                 }
@@ -1159,6 +1230,7 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                     dispatchTerminalInput("\r", "ime-modifier-editor-action")
                     scheduleModifierInputRestart()
                 }
+                resetInputLine()
                 return true
             }
 
@@ -1175,6 +1247,11 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
                 if (value.isNotEmpty()) commitText(value, 1)
                 return true
             }
+
+            override fun closeConnection() {
+                compositionTracker.clear()
+                super.closeConnection()
+            }
         }
     }
 
@@ -1183,6 +1260,15 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
         modifierInputActive = active
         setRawInputType(if (active) MODIFIER_INPUT_TYPE else TEXT_INPUT_TYPE)
         resetTerminalInput(clearBuffer = true)
+    }
+
+    fun resetInputLine() {
+        if (inputLineResetPending) return
+        inputLineResetPending = true
+        post {
+            inputLineResetPending = false
+            resetTerminalInput(clearBuffer = true)
+        }
     }
 
     private fun resetTerminalInput(clearBuffer: Boolean) {
@@ -1209,14 +1295,76 @@ private class TerminalImeEditText(context: Context) : EditText(context) {
     private fun hasComposingText(): Boolean =
         BaseInputConnection.getComposingSpanStart(text) >= 0
 
-    private fun dispatchDeletion(beforeLength: Int, afterLength: Int, source: String) {
-        dispatchTerminalInput(deletionValue(beforeLength, afterLength), source)
+    private fun currentComposingText(): String? {
+        val editable = text ?: return null
+        val first = BaseInputConnection.getComposingSpanStart(editable)
+        val second = BaseInputConnection.getComposingSpanEnd(editable)
+        if (first < 0 || second < 0 || first == second) return null
+        val start = minOf(first, second)
+        val end = maxOf(first, second)
+        if (start !in 0..editable.length || end !in 0..editable.length) return null
+        return editable.subSequence(start, end).toString()
+    }
+
+    private fun selectedSuffixCodePointCount(): Int {
+        val editable = text ?: return 0
+        return terminalImeSelectedSuffixCodePointCount(
+            value = editable.toString(),
+            selectionStart = Selection.getSelectionStart(editable),
+            selectionEnd = Selection.getSelectionEnd(editable),
+            composingStart = BaseInputConnection.getComposingSpanStart(editable),
+            composingEnd = BaseInputConnection.getComposingSpanEnd(editable),
+        )
+    }
+
+    private fun boundedDeletion(
+        beforeLength: Int,
+        afterLength: Int,
+        lengthsAreCodePoints: Boolean,
+    ): TerminalImeDeletionBounds {
+        val editable = text ?: return TerminalImeDeletionBounds(0, 0, 0, 0)
+        val bounded = terminalImeDeletionBounds(
+            value = editable.toString(),
+            selectionStart = Selection.getSelectionStart(editable),
+            selectionEnd = Selection.getSelectionEnd(editable),
+            requestedBeforeLength = beforeLength,
+            requestedAfterLength = afterLength,
+            lengthsAreCodePoints = lengthsAreCodePoints,
+        )
+        if (
+            cn.termux.ubuntumanager.BuildConfig.DEBUG &&
+            (
+                bounded.connectionBeforeLength != beforeLength ||
+                    bounded.connectionAfterLength != afterLength
+                )
+        ) {
+            Log.d(
+                TERMINAL_IME_LOG_TAG,
+                "boundedDeletion requested=$beforeLength,$afterLength " +
+                    "accepted=${bounded.connectionBeforeLength}," +
+                    "${bounded.connectionAfterLength} " +
+                    "codePoints=$lengthsAreCodePoints",
+            )
+        }
+        return bounded
+    }
+
+    private fun dispatchDeletion(bounded: TerminalImeDeletionBounds, source: String) {
+        dispatchTerminalInput(
+            deletionValue(
+                bounded.terminalBeforeCodePoints,
+                bounded.terminalAfterCodePoints,
+            ),
+            source,
+        )
     }
 
     private fun deletionValue(beforeLength: Int, afterLength: Int): String =
         buildString {
-            if (beforeLength > 0) append("\u007f".repeat(beforeLength))
-            if (afterLength > 0) append("\u001b[3~".repeat(afterLength))
+            val safeBefore = beforeLength.coerceIn(0, MAX_EDITOR_BUFFER_CHARS)
+            val safeAfter = afterLength.coerceIn(0, MAX_EDITOR_BUFFER_CHARS)
+            if (safeBefore > 0) append("\u007f".repeat(safeBefore))
+            if (safeAfter > 0) append("\u001b[3~".repeat(safeAfter))
         }
 
     private fun modifierInputCharacter(value: String): String? =
