@@ -451,6 +451,7 @@ fun UbuntuManagerApp(
                         ?.second,
                     onNavigateBack = { navController.popBackStack() },
                     onOpenSession = { viewModel.openLocalSession(name) },
+                    onRefreshHistory = { viewModel.refreshLocalSessionHistory(name) },
                     onCloseSession = { viewModel.closeLocalSession(name) },
                     onEndSession = {
                         viewModel.endLocalSession(name)

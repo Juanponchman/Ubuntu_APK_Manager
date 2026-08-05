@@ -43,6 +43,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var statusMonitoringJob: Job? = null
     private var refreshJob: Job? = null
     private var localSessionJob: Job? = null
+    private var localSessionHistoryJob: Job? = null
     private var requestedLocalSessionName: String? = null
 
     init {
@@ -194,11 +195,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val current = _localSessionState.value
         if (current.instanceName != name) return
+        localSessionHistoryJob?.cancel()
+        localSessionHistoryJob = null
         _localSessionState.value = LocalSessionState()
         current.port?.let { port ->
             viewModelScope.launch {
                 repository.closeLocalSession(name, port)
                 repository.refreshRuntime()
+            }
+        }
+    }
+
+    fun refreshLocalSessionHistory(name: String) {
+        val current = _localSessionState.value
+        if (
+            current.instanceName != name ||
+            current.phase != LocalSessionPhase.READY ||
+            localSessionHistoryJob?.isActive == true
+        ) {
+            return
+        }
+        localSessionHistoryJob = viewModelScope.launch {
+            val snapshot = runCatching {
+                repository.captureLocalTerminalHistory(name)
+            }.getOrNull().orEmpty()
+            val latest = _localSessionState.value
+            if (
+                snapshot.isNotEmpty() &&
+                latest.instanceName == name &&
+                latest.phase == LocalSessionPhase.READY &&
+                latest.historySnapshot != snapshot
+            ) {
+                _localSessionState.value = latest.copy(historySnapshot = snapshot)
             }
         }
     }
@@ -209,6 +237,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         localSessionJob?.cancel()
         localSessionJob = null
+        localSessionHistoryJob?.cancel()
+        localSessionHistoryJob = null
         val current = _localSessionState.value
         val port = current.port.takeIf { current.instanceName == name }
         _localSessionState.value = LocalSessionState()

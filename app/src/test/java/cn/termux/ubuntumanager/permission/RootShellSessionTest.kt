@@ -47,4 +47,24 @@ class RootShellSessionTest {
             session.close()
         }
     }
+
+    @Test
+    fun supportsLargerCaptureLimitForTerminalHistory() {
+        val process = ProcessBuilder("/bin/sh").redirectErrorStream(true).start()
+        val session = RootShellSession(process)
+        try {
+            val result = session.execute(
+                "head -c 100000 /dev/zero | tr '\\000' x",
+                2_000,
+                null,
+                maxCaptureLength = 120_000,
+            )
+
+            assertTrue(result.bestError, result.isSuccess)
+            assertEquals(100_000, result.stdout.length)
+            assertTrue(result.stdoutOriginalLength >= 100_000)
+        } finally {
+            session.close()
+        }
+    }
 }

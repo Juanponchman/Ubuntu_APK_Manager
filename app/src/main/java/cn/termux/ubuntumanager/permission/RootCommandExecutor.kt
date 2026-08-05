@@ -48,19 +48,31 @@ class RootCommandExecutor(context: Context) {
         script: String,
         timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
         input: InputStream? = null,
-    ): CommandResult = executeMutex.withLock { executeUnlocked(script, timeoutMillis, input) }
+        maxCaptureLength: Int = DEFAULT_MAX_CAPTURE_LENGTH,
+    ): CommandResult {
+        require(maxCaptureLength > 0) { "输出抓取上限必须大于 0" }
+        return executeMutex.withLock {
+            executeUnlocked(script, timeoutMillis, input, maxCaptureLength)
+        }
+    }
 
     private suspend fun executeUnlocked(
         script: String,
         timeoutMillis: Long,
         input: InputStream?,
+        maxCaptureLength: Int,
     ): CommandResult = withContext(Dispatchers.IO) {
         val stagedInput = input?.let(::stageInput)
         try {
             val session = rootSession?.takeIf { it.isAlive } ?: startRootSession().also {
                 rootSession = it
             }
-            val result = session.execute(script, timeoutMillis, stagedInput)
+            val result = session.execute(
+                script,
+                timeoutMillis,
+                stagedInput,
+                maxCaptureLength,
+            )
             if (!session.isAlive || result.internalErrorCode != -1) {
                 session.close()
                 if (rootSession === session) rootSession = null
@@ -96,6 +108,7 @@ class RootCommandExecutor(context: Context) {
 
     companion object {
         const val DEFAULT_TIMEOUT_MILLIS = 120_000L
+        const val DEFAULT_MAX_CAPTURE_LENGTH = 64_000
     }
 }
 
@@ -109,7 +122,12 @@ internal class RootShellSession(private val process: Process) {
     val isAlive: Boolean
         get() = process.isAlive
 
-    fun execute(script: String, timeoutMillis: Long, input: File?): CommandResult {
+    fun execute(
+        script: String,
+        timeoutMillis: Long,
+        input: File?,
+        maxCaptureLength: Int = RootCommandExecutor.DEFAULT_MAX_CAPTURE_LENGTH,
+    ): CommandResult {
         if (!process.isAlive) return sessionEnded()
         val marker = "__CNTERMUX_DONE_${UUID.randomUUID().toString().replace("-", "")}__"
         return try {
@@ -123,7 +141,9 @@ internal class RootShellSession(private val process: Process) {
                 .append("%s\\n' \"${'$'}_cntermux_result\"\n")
             writer.flush()
 
-            val pending = readerExecutor.submit<CommandResult> { readUntil(marker) }
+            val pending = readerExecutor.submit<CommandResult> {
+                readUntil(marker, maxCaptureLength)
+            }
             try {
                 pending.get(timeoutMillis, TimeUnit.MILLISECONDS)
             } catch (_: TimeoutException) {
@@ -143,7 +163,7 @@ internal class RootShellSession(private val process: Process) {
         }
     }
 
-    private fun readUntil(marker: String): CommandResult {
+    private fun readUntil(marker: String, maxCaptureLength: Int): CommandResult {
         val output = StringBuilder()
         var originalLength = 0
         while (true) {
@@ -163,8 +183,8 @@ internal class RootShellSession(private val process: Process) {
             }
             originalLength += line.length + 1
             output.append(line).append('\n')
-            if (output.length > MAX_CAPTURE_LENGTH * 2) {
-                output.delete(0, output.length - MAX_CAPTURE_LENGTH)
+            if (output.length > maxCaptureLength) {
+                output.delete(0, output.length - maxCaptureLength)
             }
         }
     }
@@ -180,10 +200,6 @@ internal class RootShellSession(private val process: Process) {
         internalErrorCode = 1,
         internalErrorMessage = output.trim().ifBlank { "Root 会话已经结束" },
     )
-
-    companion object {
-        private const val MAX_CAPTURE_LENGTH = 64_000
-    }
 }
 
 internal object AlphaSuContract {

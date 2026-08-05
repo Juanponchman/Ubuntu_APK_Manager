@@ -158,6 +158,7 @@ fun LocalSessionScreen(
     pendingKeyActionId: String?,
     onNavigateBack: () -> Unit,
     onOpenSession: () -> Unit,
+    onRefreshHistory: () -> Unit,
     onCloseSession: () -> Unit,
     onEndSession: () -> Unit,
     onPendingKeyActionConsumed: () -> Unit,
@@ -420,6 +421,7 @@ fun LocalSessionScreen(
                         ctrlMode = ctrlMode,
                         altMode = altMode,
                         historySnapshot = sessionState.historySnapshot,
+                        onRefreshHistory = onRefreshHistory,
                         onModifiedInput = ::sendAdaptiveInput,
                         onCopySelection = { selected ->
                             copyCommand(context, selected)
@@ -1539,13 +1541,24 @@ private class TerminalHostView(context: Context) : FrameLayout(context) {
             )
             terminal.dispatchTouchEvent(cancelEvent)
             cancelEvent.recycle()
+            val snapshotX = touchDownX.toDouble()
+            val snapshotY = touchDownY.toDouble()
+            val snapshotWidth = terminal.width.coerceAtLeast(1)
+            val snapshotHeight = terminal.height.coerceAtLeast(1)
             terminal.evaluateJavascript(
-                "window.__ubuntuSelectionSnapshot && " +
-                    "window.__ubuntuSelectionSnapshot();",
+                "(function(){" +
+                    "window.__ubuntuSetNativeSelectionActive && " +
+                    "window.__ubuntuSetNativeSelectionActive(true);" +
+                    "return window.__ubuntuSelectionSnapshot && " +
+                    "window.__ubuntuSelectionSnapshot(" +
+                    "$snapshotX,$snapshotY,$snapshotWidth,$snapshotHeight);" +
+                    "})();",
             ) { encoded ->
                 val snapshot = parseSelectionSnapshot(encoded)
                 if (nativeSelectionRequested && snapshot.text.isNotEmpty()) {
                     showNativeSelection(snapshot, touchDownX, touchDownY)
+                } else {
+                    setNativeSelectionActive(false)
                 }
             }
         }
@@ -1573,6 +1586,11 @@ private class TerminalHostView(context: Context) : FrameLayout(context) {
                     prefixLines = value.optInt("prefixLines", 0).coerceAtLeast(0),
                     viewportRows = value.optInt("viewportRows", 1).coerceAtLeast(1),
                     columns = value.optInt("columns", 1).coerceAtLeast(1),
+                    selectionOffset = value.optInt("selectionOffset", -1),
+                    selectionViewportY = value.optDouble(
+                        "selectionViewportY",
+                        -1.0,
+                    ).toFloat(),
                 )
                 is String -> TerminalSelectionSnapshot(text = value)
                 else -> TerminalSelectionSnapshot()
@@ -1596,6 +1614,7 @@ private class TerminalHostView(context: Context) : FrameLayout(context) {
                     removeView(view)
                     selectionOverlay = null
                     nativeSelectionRequested = false
+                    setNativeSelectionActive(false)
                     if (resumeInput) {
                         post { requestTerminalInput() }
                     } else {
@@ -1617,6 +1636,14 @@ private class TerminalHostView(context: Context) : FrameLayout(context) {
         overlay.postDelayed({ overlay.beginSelectionAt(x, y) }, 120L)
     }
 
+    private fun setNativeSelectionActive(active: Boolean) {
+        terminal.evaluateJavascript(
+            "window.__ubuntuSetNativeSelectionActive && " +
+                "window.__ubuntuSetNativeSelectionActive($active);",
+            null,
+        )
+    }
+
     private companion object {
         const val INPUT_TAP_TIMEOUT_MILLIS = 320L
         const val INPUT_TAP_SLOP_PX = 24f
@@ -1629,6 +1656,8 @@ private data class TerminalSelectionSnapshot(
     val prefixLines: Int = 0,
     val viewportRows: Int = 1,
     val columns: Int = 1,
+    val selectionOffset: Int = -1,
+    val selectionViewportY: Float = -1f,
 )
 
 private class TerminalSelectionTextView(
@@ -1773,10 +1802,12 @@ private class TerminalSelectionTextView(
         setLineSpacing(targetRowHeight - paint.fontSpacing, 1f)
         terminalMetricsApplied = true
         post {
-            scrollTo(
-                0,
-                (snapshot.prefixLines * targetRowHeight).toInt().coerceAtLeast(0),
-            )
+            if (!scrollToSnapshotOffset()) {
+                scrollTo(
+                    0,
+                    (snapshot.prefixLines * targetRowHeight).toInt().coerceAtLeast(0),
+                )
+            }
         }
     }
 
@@ -1787,19 +1818,52 @@ private class TerminalSelectionTextView(
             return
         }
         requestFocus()
+        scrollToSnapshotOffset()
+        var selectionX = x
+        var selectionY = y
+        if (snapshot.selectionOffset >= 0) {
+            val safeOffset = snapshot.selectionOffset.coerceIn(0, text.length - 1)
+            val textLayout = layout ?: return
+            val line = textLayout.getLineForOffset(safeOffset)
+            selectionX = (
+                totalPaddingLeft + textLayout.getPrimaryHorizontal(safeOffset) +
+                    paint.measureText("M") * 0.25f - scrollX
+                ).coerceIn(1f, width - 1f)
+            selectionY = (
+                totalPaddingTop +
+                    (textLayout.getLineTop(line) + textLayout.getLineBottom(line)) / 2f -
+                    scrollY
+                ).coerceIn(1f, height - 1f)
+        }
         val now = SystemClock.uptimeMillis()
-        val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
+        val down = MotionEvent.obtain(
+            now,
+            now,
+            MotionEvent.ACTION_DOWN,
+            selectionX,
+            selectionY,
+            0,
+        )
         dispatchTouchEvent(down)
         down.recycle()
-        val handled = performLongClick(x, y)
-        val up = MotionEvent.obtain(now, now, MotionEvent.ACTION_UP, x, y, 0)
+        val handled = performLongClick(selectionX, selectionY)
+        val up = MotionEvent.obtain(
+            now,
+            now,
+            MotionEvent.ACTION_UP,
+            selectionX,
+            selectionY,
+            0,
+        )
         dispatchTouchEvent(up)
         up.recycle()
         if (cn.termux.ubuntumanager.BuildConfig.DEBUG) {
             Log.d(
                 "CnTerminalSelection",
-                "handled=$handled point=${x.toInt()},${y.toInt()} " +
+                "handled=$handled point=${selectionX.toInt()},${selectionY.toInt()} " +
                     "size=${width}x${height} lines=${layout?.lineCount ?: 0} " +
+                    "snapshot=${snapshot.selectionOffset}@" +
+                    "${snapshot.selectionViewportY.toInt()} scroll=$scrollY " +
                     "selection=$selectionStart..$selectionEnd",
             )
         }
@@ -1808,6 +1872,25 @@ private class TerminalSelectionTextView(
         } else {
             post { finishSelection(resumeInput = false) }
         }
+    }
+
+    private fun scrollToSnapshotOffset(): Boolean {
+        val textLayout = layout ?: return false
+        val requestedOffset = snapshot.selectionOffset
+        if (requestedOffset < 0 || text.isEmpty() || height <= 0) return false
+        val safeOffset = requestedOffset.coerceIn(0, text.length - 1)
+        val line = textLayout.getLineForOffset(safeOffset)
+        val viewportY = snapshot.selectionViewportY
+            .takeIf { it >= 0f }
+            ?: (height / 2f)
+        val contentHeight =
+            (height - totalPaddingTop - totalPaddingBottom).coerceAtLeast(1)
+        val maximumScroll = (textLayout.height - contentHeight).coerceAtLeast(0)
+        val targetScroll = (
+            textLayout.getLineTop(line) - (viewportY - totalPaddingTop)
+            ).roundToInt().coerceIn(0, maximumScroll)
+        scrollTo(0, targetScroll)
+        return true
     }
 
     fun requestExit(resumeInput: Boolean) {
@@ -1896,10 +1979,12 @@ private fun LocalTerminalWebView(
     altMode: TerminalModifierMode,
     onModifiedInput: (String, String) -> Unit,
     onCopySelection: (String) -> Unit,
+    onRefreshHistory: () -> Unit,
     onScrollChanged: (Int, Int, Int, Boolean, Float, Float, Boolean) -> Unit,
 ) {
     val currentModifiedInput = rememberUpdatedState(onModifiedInput)
     val currentCopySelection = rememberUpdatedState(onCopySelection)
+    val currentRefreshHistory = rememberUpdatedState(onRefreshHistory)
     val currentScrollChanged = rememberUpdatedState(onScrollChanged)
     var rendererGeneration by remember(url) { mutableIntStateOf(0) }
     val bridge: TerminalJavascriptBridge = remember {
@@ -1908,6 +1993,7 @@ private fun LocalTerminalWebView(
                 currentModifiedInput.value(value, "web-keydown")
             },
             onCopySelection = { currentCopySelection.value(it) },
+            onRefreshHistory = { currentRefreshHistory.value() },
             onScrollChanged = {
                     position,
                     total,
@@ -2054,6 +2140,7 @@ private fun LocalTerminalWebView(
 private class TerminalJavascriptBridge(
     private val onModifiedInput: (String) -> Unit,
     private val onCopySelection: (String) -> Unit,
+    private val onRefreshHistory: () -> Unit,
     private val onScrollChanged: (Int, Int, Int, Boolean, Float, Float, Boolean) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -2066,6 +2153,11 @@ private class TerminalJavascriptBridge(
     @JavascriptInterface
     fun onCopySelection(value: String) {
         if (value.isNotEmpty()) mainHandler.post { onCopySelection(value) }
+    }
+
+    @JavascriptInterface
+    fun requestHistoryRefresh() {
+        mainHandler.post(onRefreshHistory)
     }
 
     @JavascriptInterface
@@ -2156,7 +2248,11 @@ private fun loadCompatibleTerminalPage(url: String): WebResourceResponse? = runC
 
 private const val TERMINAL_BRIDGE_NAME = "UbuntuTerminalBridge"
 
-private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT = """
+private val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT: String
+    get() = LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT_PART_1 +
+        LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT_PART_2
+
+private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT_PART_1 = """
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <style>
 html,
@@ -2409,6 +2505,7 @@ body {
   var initialLatestTimers = [];
   var userHasInteracted = false;
   var historyReviewing = false;
+  var historyFollowLatest = true;
   var reviewScrollTop = 0;
   var activeTouchId = null;
   var touchStartX = 0;
@@ -2444,6 +2541,10 @@ body {
   var historyPrefixLines = [];
   var lastTerminalFrame = null;
   var historyRenderTimer = null;
+  var historyRenderDeferred = false;
+  var historyRefreshRequestedAt = 0;
+  var pendingHistorySource = null;
+  var nativeSelectionActive = false;
   var pendingScrollPixels = 0;
   var scrollAnimationFrame = null;
   var scrollReportTimer = null;
@@ -2474,6 +2575,7 @@ body {
   function prepareForTerminalInput() {
     if (!historyReviewing && !tmuxCopyMode && !tmuxCopyPending) return;
     historyReviewing = false;
+    historyFollowLatest = true;
     historyActive = false;
     if (historyLayer) historyLayer.style.display = 'none';
     pendingTmuxLines = 0;
@@ -2556,7 +2658,12 @@ body {
     historyLayer.appendChild(historyPre);
     touchSurface.appendChild(historyLayer);
     historyLayer.addEventListener('scroll', function () {
-      historyReviewing = true;
+      var maximum = Math.max(
+        0,
+        historyLayer.scrollHeight - historyLayer.clientHeight
+      );
+      historyFollowLatest = maximum - historyLayer.scrollTop <= rowHeight();
+      historyReviewing = !historyFollowLatest;
       scheduleScrollReport();
     }, {passive: true});
   }
@@ -2594,11 +2701,85 @@ body {
       historyPrefixLines = historyPrefixLines.concat(
         lastTerminalFrame.slice(0, shift)
       );
-      if (historyPrefixLines.length > 12000) {
-        historyPrefixLines = historyPrefixLines.slice(-12000);
+      if (historyPrefixLines.length > 100000) {
+        historyPrefixLines = historyPrefixLines.slice(-100000);
       }
     }
     lastTerminalFrame = frame;
+  }
+
+  function historyUpdatesBlocked() {
+    return nativeSelectionActive || scrollGesture || scrollbarDragging;
+  }
+
+  function findClosestHistoryContext(text, context, expectedOffset) {
+    if (!context) return -1;
+    var best = -1;
+    var bestDistance = Number.MAX_SAFE_INTEGER;
+    var searchFrom = 0;
+    while (searchFrom <= text.length) {
+      var match = text.indexOf(context, searchFrom);
+      if (match < 0) break;
+      var distance = Math.abs(match - expectedOffset);
+      if (distance < bestDistance) {
+        best = match;
+        bestDistance = distance;
+      }
+      searchFrom = match + 1;
+    }
+    return best;
+  }
+
+  function captureHistoryAnchor() {
+    if (!historyLayer || !historyPre || !historyPre.firstChild) return null;
+    var text = historyPre.textContent || '';
+    if (!text) return null;
+    var layerRect = historyLayer.getBoundingClientRect();
+    var offset = historyOffsetAt(
+      layerRect.left + 4,
+      layerRect.top + Math.min(rowHeight() / 2, layerRect.height / 2)
+    );
+    if (offset === null) return {offset: 0, viewportY: 0, scrollTop: historyLayer.scrollTop};
+    var characterRect = historyCharacterRect(offset, false);
+    var contextStart = Math.max(0, offset - 96);
+    var contextEnd = Math.min(text.length, offset + 160);
+    return {
+      offset: offset,
+      viewportY: characterRect ? characterRect.top - layerRect.top : 0,
+      scrollTop: historyLayer.scrollTop,
+      context: text.slice(contextStart, contextEnd),
+      offsetInContext: offset - contextStart
+    };
+  }
+
+  function restoreHistoryAnchor(anchor) {
+    if (!anchor || !historyLayer || !historyPre || !historyPre.firstChild) return;
+    var text = historyPre.textContent || '';
+    if (!text) {
+      historyLayer.scrollTop = 0;
+      return;
+    }
+    var expectedContextStart = Math.max(0, anchor.offset - anchor.offsetInContext);
+    var contextStart = findClosestHistoryContext(
+      text,
+      anchor.context,
+      expectedContextStart
+    );
+    var offset = contextStart >= 0
+      ? contextStart + anchor.offsetInContext
+      : Math.min(text.length - 1, anchor.offset);
+    var maximum = Math.max(
+      0,
+      historyLayer.scrollHeight - historyLayer.clientHeight
+    );
+    historyLayer.scrollTop = Math.max(0, Math.min(maximum, anchor.scrollTop));
+    var characterRect = historyCharacterRect(offset, false);
+    if (!characterRect) return;
+    var layerRect = historyLayer.getBoundingClientRect();
+    historyLayer.scrollTop = Math.max(0, Math.min(
+      maximum,
+      historyLayer.scrollTop + characterRect.top - layerRect.top - anchor.viewportY
+    ));
   }
 
   function renderHistoryNow() {
@@ -2606,37 +2787,79 @@ body {
     if (!historyActive) return;
     ensureHistoryLayer();
     if (!historyLayer || !historyPre) return;
+    if (historyUpdatesBlocked()) {
+      historyRenderDeferred = true;
+      return;
+    }
     var selection = window.getSelection ? window.getSelection() : null;
     if (selection && !selection.isCollapsed &&
-        historyLayer.contains(selection.anchorNode)) return;
-    var distanceFromBottom = Math.max(
-      0,
-      historyLayer.scrollHeight - historyLayer.scrollTop - historyLayer.clientHeight
-    );
+        historyLayer.contains(selection.anchorNode)) {
+      historyRenderDeferred = true;
+      return;
+    }
+    historyRenderDeferred = false;
+    var anchor = historyFollowLatest ? null : captureHistoryAnchor();
     historyPre.textContent = historyPrefixLines.concat(
       lastTerminalFrame || []
     ).join('\n');
-    if (distanceFromBottom <= rowHeight() * 1.5) {
+    if (historyFollowLatest) {
       historyLayer.scrollTop = historyLayer.scrollHeight;
+      historyReviewing = false;
     } else {
-      historyLayer.scrollTop = Math.max(
-        0,
-        historyLayer.scrollHeight - historyLayer.clientHeight - distanceFromBottom
-      );
+      restoreHistoryAnchor(anchor);
+      historyReviewing = true;
     }
   }
 
   function scheduleHistoryRender() {
-    if (!historyActive || historyRenderTimer !== null) return;
+    if (!historyActive) return;
+    if (historyUpdatesBlocked()) {
+      historyRenderDeferred = true;
+      return;
+    }
+    if (historyRenderTimer !== null) return;
     historyRenderTimer = window.setTimeout(renderHistoryNow, 80);
   }
 
+  function applyHistorySource(next) {
+    if (next === historySource) return;
+    historySource = next;
+    historySourceLines = next ? next.replace(/\r/g, '').split('\n') : [];
+    historyPrefixLines = [];
+    lastTerminalFrame = null;
+    updateHistoryFrame();
+    if (historyActive) renderHistoryNow();
+  }
+
+  function flushDeferredHistoryUpdates() {
+    if (historyUpdatesBlocked()) return;
+    if (pendingHistorySource !== null) {
+      var next = pendingHistorySource;
+      pendingHistorySource = null;
+      applyHistorySource(next);
+      if (!historyRenderDeferred) return;
+    }
+    if (historyRenderDeferred) renderHistoryNow();
+  }
+
+  function requestHistoryRefresh() {
+    var now = Date.now();
+    if (now - historyRefreshRequestedAt < 700) return;
+    historyRefreshRequestedAt = now;
+    try {
+      window.UbuntuTerminalBridge.requestHistoryRefresh();
+    } catch (ignored) {
+    }
+  }
+
   function openHistoryReview() {
+    requestHistoryRefresh();
     ensureHistoryLayer();
     if (!historyLayer) return false;
     updateHistoryFrame();
     historyActive = true;
-    historyReviewing = true;
+    historyFollowLatest = true;
+    historyReviewing = false;
     historyLayer.style.display = 'block';
     if (historyPre) {
       historyPre.textContent = historyPrefixLines.concat(
@@ -2650,23 +2873,55 @@ body {
 
   window.__ubuntuSetHistory = function (text) {
     var next = String(text || '');
-    if (next === historySource) return;
-    historySource = next;
-    historySourceLines = next ? next.replace(/\r/g, '').split('\n') : [];
-    historyPrefixLines = [];
-    lastTerminalFrame = null;
-    updateHistoryFrame();
-    if (historyActive) renderHistoryNow();
+    if (historyUpdatesBlocked()) {
+      pendingHistorySource = next;
+      historyRenderDeferred = true;
+      return;
+    }
+    applyHistorySource(next);
   };
 
-  window.__ubuntuSelectionSnapshot = function () {
+  window.__ubuntuSetNativeSelectionActive = function (active) {
+    nativeSelectionActive = !!active;
+    if (!nativeSelectionActive) {
+      flushDeferredHistoryUpdates();
+      window.setTimeout(reportScroll, 20);
+    }
+  };
+
+  window.__ubuntuSelectionSnapshot = function (
+      clientX,
+      clientY,
+      sourceWidth,
+      sourceHeight
+  ) {
     updateHistoryFrame();
     if (historyActive && historyPre) {
+      var rawX = Number(clientX) || 0;
+      var rawY = Number(clientY) || 0;
+      var surfaceRect = touchSurface
+        ? touchSurface.getBoundingClientRect()
+        : historyLayer.getBoundingClientRect();
+      var mappedX = surfaceRect.left + rawX * surfaceRect.width /
+        Math.max(1, Number(sourceWidth) || surfaceRect.width);
+      var mappedY = surfaceRect.top + rawY * surfaceRect.height /
+        Math.max(1, Number(sourceHeight) || surfaceRect.height);
+      var selectionOffset = historyOffsetAt(mappedX, mappedY);
+      var selectionRect = selectionOffset === null
+        ? null
+        : historyCharacterRect(selectionOffset, false);
+      var selectionViewportY = selectionRect
+        ? (selectionRect.top - surfaceRect.top) *
+          Math.max(1, Number(sourceHeight) || surfaceRect.height) /
+          Math.max(1, surfaceRect.height)
+        : rawY;
       return {
         text: historyPre.textContent || '',
         prefixLines: 0,
         viewportRows: Math.max(1, (window.term && window.term.rows) || 1),
-        columns: Math.max(1, (window.term && window.term.cols) || 1)
+        columns: Math.max(1, (window.term && window.term.cols) || 1),
+        selectionOffset: selectionOffset === null ? -1 : selectionOffset,
+        selectionViewportY: selectionViewportY
       };
     }
     var frame = lastTerminalFrame || readTerminalFrame() || [];
@@ -2817,7 +3072,7 @@ body {
           historyAtBottom,
           historyFraction,
           historyViewportFraction,
-          true
+          historyReviewing
         );
       } catch (ignored) {
       }
@@ -2941,17 +3196,24 @@ body {
     if (!viewport) return;
     if (historyActive && historyLayer) {
       historyReviewing = true;
+      historyFollowLatest = false;
       historyLayer.scrollTop -= deltaY;
     } else if (tmuxCopyMode || tmuxCopyPending) {
       sendTerminalData('q');
       tmuxCopyMode = false;
       tmuxCopyPending = false;
-      if (openHistoryReview() && historyLayer) historyLayer.scrollTop -= deltaY;
+      if (openHistoryReview() && historyLayer) {
+        historyFollowLatest = false;
+        historyReviewing = true;
+        historyLayer.scrollTop -= deltaY;
+      }
     } else if (viewport.scrollHeight - viewport.clientHeight > 1) {
       historyReviewing = true;
       viewport.scrollTop -= deltaY;
       reviewScrollTop = viewport.scrollTop;
     } else if (openHistoryReview() && historyLayer) {
+      historyFollowLatest = false;
+      historyReviewing = true;
       historyLayer.scrollTop -= deltaY;
     }
     scheduleScrollReport();
@@ -2970,6 +3232,9 @@ body {
     scrollAnimationFrame = window.requestAnimationFrame(flushPendingScroll);
   }
 
+"""
+
+private const val LOCAL_WEBVIEW_COMPATIBILITY_SCRIPT_PART_2 = """
   function maintainReviewAnchor() {
     if (historyActive || !viewport || !historyReviewing ||
         tmuxCopyMode || tmuxCopyPending ||
@@ -3592,6 +3857,7 @@ body {
     }
     var documentSelection = window.getSelection ? window.getSelection() : null;
     if (documentSelection) documentSelection.removeAllRanges();
+    flushDeferredHistoryUpdates();
   };
 
   function resetTerminalTouch() {
@@ -3618,6 +3884,7 @@ body {
     selectionGesture = false;
     tmuxTouchPixels = 0;
     pendingScrollPixels = 0;
+    window.setTimeout(flushDeferredHistoryUpdates, 0);
   }
 
   function flushSelectionMove() {
@@ -3819,6 +4086,8 @@ body {
   function endTerminalPointer(event) {
     if (event.pointerId !== activeTouchId && activeTouchId !== null &&
         event.type !== 'pointercancel') return;
+    var completedHistoryScroll = historyActive &&
+      (scrollbarDragging || scrollGesture);
     var handled = scrollbarDragging || selectionGesture || scrollGesture;
     var completedSelection = selectionGesture;
     if (completedSelection && selectionMoveAnimationFrame !== null) {
@@ -3828,6 +4097,7 @@ body {
     }
     if (selectionMagnifier) selectionMagnifier.style.display = 'none';
     resetTerminalTouch();
+    if (completedHistoryScroll) requestHistoryRefresh();
     if (completedSelection) {
       if (selectionKind === 'history') {
         applyHistorySelection();
@@ -3884,6 +4154,7 @@ body {
     historyLayer = null;
     historyPre = null;
     historyActive = false;
+    historyFollowLatest = true;
     ensureHistoryLayer();
     viewport.addEventListener('scroll', function () {
       if (historyActive) return;
@@ -3896,6 +4167,7 @@ body {
     window.__ubuntuScrollToLatest = function () {
       if (!viewport) return;
       historyReviewing = false;
+      historyFollowLatest = true;
       historyActive = false;
       if (historyLayer) historyLayer.style.display = 'none';
       pendingTmuxLines = 0;
@@ -3913,8 +4185,9 @@ body {
     };
     window.__ubuntuScrollToFraction = function (fraction, immediate) {
       if (!viewport) return;
-      historyReviewing = true;
       var safeFraction = Math.max(0, Math.min(1, Number(fraction) || 0));
+      historyFollowLatest = safeFraction >= 0.999;
+      historyReviewing = !historyFollowLatest;
       if (historyActive && historyLayer) {
         var historyMaxScroll = Math.max(
           0,

@@ -649,6 +649,11 @@ class UbuntuRepository(
         // 离开页面只断开 WebView；ttyd 与 tmux 仍留在同一个 Chroot 实例中。
     }
 
+    suspend fun captureLocalTerminalHistory(name: String): String {
+        requireInstance(name)
+        return chrootClient.captureLocalTerminalHistory(name)
+    }
+
     suspend fun endLocalSession(name: String, port: Int?) {
         if (port != null) {
             runCatching { chrootClient.stopLocalTerminal(name, port) }

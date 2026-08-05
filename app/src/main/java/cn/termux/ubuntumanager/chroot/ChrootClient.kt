@@ -406,6 +406,7 @@ class ChrootClient(
         val result = executeScript(
             name,
             "tmux capture-pane -p -S - -t cntermux 2>/dev/null || true",
+            maxCaptureLength = LOCAL_TERMINAL_HISTORY_CAPTURE_LENGTH,
         )
         return if (result.isSuccess) result.stdout.trimEnd() else ""
     }
@@ -424,8 +425,10 @@ class ChrootClient(
                 "> /etc/profile.d/cntermux-locale.sh; " +
                 "chmod 644 /etc/profile.d/cntermux-locale.sh; " +
                 "if tmux has-session -t cntermux 2>/dev/null; then " +
+                "tmux set-option -g history-limit $LOCAL_TERMINAL_HISTORY_LIMIT; " +
                 "tmux set-environment -g LANG C.UTF-8; " +
-                "tmux set-environment -g LC_ALL C.UTF-8; fi; " +
+                "tmux set-environment -g LC_ALL C.UTF-8; " +
+                "printf 'HISTORY_LIMIT=%s\\n' \"\$(tmux show-options -gv history-limit)\"; fi; " +
                 "pid=\$(cat /run/cntermux/ttyd.pid 2>/dev/null || true); " +
                 "[ -n \"\${pid}\" ] || exit 1; " +
                 "tr '\\000' '\\n' < /proc/\${pid}/environ 2>/dev/null; " +
@@ -435,6 +438,9 @@ class ChrootClient(
         if (
             compatibility.isSuccess &&
             compatibility.stdout.lineSequence().any { it == "LANG=C.UTF-8" } &&
+            compatibility.stdout.lineSequence().any {
+                it == "HISTORY_LIMIT=$LOCAL_TERMINAL_HISTORY_LIMIT"
+            } &&
             (
                 compatibility.stdout.contains("rendererType=canvas") ||
                     compatibility.stdout.contains("rendererType canvas")
@@ -451,7 +457,8 @@ class ChrootClient(
                 compatibility.stdout.contains("fontFamily=serif-monospace") ||
                     compatibility.stdout.contains("fontFamily serif-monospace")
             ) &&
-            compatibility.stdout.contains("tmux -u new-session")
+            compatibility.stdout.contains("tmux -u") &&
+            compatibility.stdout.contains("new-session -A -s cntermux")
         ) {
             return success("ALREADY_COMPATIBLE")
         }
@@ -474,9 +481,12 @@ class ChrootClient(
               >/etc/profile.d/cntermux-locale.sh
             chmod 644 /etc/profile.d/cntermux-locale.sh
             if tmux has-session -t cntermux 2>/dev/null; then
+              tmux set-option -g history-limit $LOCAL_TERMINAL_HISTORY_LIMIT
               tmux set-environment -g LANG C.UTF-8
               tmux set-environment -g LC_ALL C.UTF-8
             fi
+            printf '%s\n' 'set-option -g history-limit $LOCAL_TERMINAL_HISTORY_LIMIT' \
+              >/run/cntermux/tmux.conf
             if [ -f /run/cntermux/ttyd.pid ] && kill -0 "${'$'}(cat /run/cntermux/ttyd.pid)" 2>/dev/null; then
               exit 0
             fi
@@ -486,7 +496,7 @@ class ChrootClient(
               -t fontSize=10 \
               -t letterSpacing=0 \
               -t 'fontFamily=serif-monospace,Noto Sans CJK SC,sans-serif' \
-              tmux -u new-session -A -s cntermux \
+              tmux -u -f /run/cntermux/tmux.conf new-session -A -s cntermux \
               >/var/log/cntermux/ttyd.log 2>&1 </dev/null &
             printf '%s\n' "${'$'}!" >/run/cntermux/ttyd.pid
         """.trimIndent()
@@ -872,10 +882,18 @@ class ChrootClient(
     fun parseVersion(raw: String): String? = raw.lineSequence().firstOrNull { it.contains("Root Chroot") }
     fun isCompatibleVersion(version: String?): Boolean = version != null
 
-    private suspend fun helper(args: String, timeoutMillis: Long): CommandResult {
+    private suspend fun helper(
+        args: String,
+        timeoutMillis: Long,
+        maxCaptureLength: Int = RootCommandExecutor.DEFAULT_MAX_CAPTURE_LENGTH,
+    ): CommandResult {
         val ready = bootstrap()
         if (!ready.isSuccess) return ready
-        return root.execute("'${ChrootContract.HELPER_PATH}' $args", timeoutMillis)
+        return root.execute(
+            "'${ChrootContract.HELPER_PATH}' $args",
+            timeoutMillis,
+            maxCaptureLength = maxCaptureLength,
+        )
     }
 
     private fun backendProbeCommand(): String =
@@ -953,10 +971,11 @@ class ChrootClient(
         name: String,
         script: String,
         timeoutMillis: Long = DEFAULT_TIMEOUT_MILLIS,
+        maxCaptureLength: Int = RootCommandExecutor.DEFAULT_MAX_CAPTURE_LENGTH,
     ): CommandResult {
         requireValidName(name)
         val encoded = Base64.encodeToString(script.toByteArray(), Base64.NO_WRAP)
-        return helper("exec $name $encoded", timeoutMillis)
+        return helper("exec $name $encoded", timeoutMillis, maxCaptureLength)
     }
 
     private suspend fun downloadUbuntuBase(): File = withContext(Dispatchers.IO) {
@@ -1026,6 +1045,8 @@ class ChrootClient(
         const val DEFAULT_ROOT_PASSWORD = ChrootContract.DEFAULT_ROOT_PASSWORD
         const val DEFAULT_TIMEOUT_MILLIS = 30_000L
         const val LONG_TIMEOUT_MILLIS = 30 * 60_000L
+        internal const val LOCAL_TERMINAL_HISTORY_LIMIT = 100_000
+        private const val LOCAL_TERMINAL_HISTORY_CAPTURE_LENGTH = 16_000_000
         private const val CREATE_TIMEOUT_MILLIS = 30 * 60_000L
         private const val MAX_AUTO_START_INSTANCES = 32
         const val MAX_BACKUP_DISPLAY_NAME_LENGTH = 60

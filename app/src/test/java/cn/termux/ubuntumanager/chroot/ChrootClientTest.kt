@@ -14,6 +14,11 @@ class ChrootClientTest {
     }
 
     @Test
+    fun localTerminalKeepsLargeScrollback() {
+        assertEquals(100_000, ChrootClient.LOCAL_TERMINAL_HISTORY_LIMIT)
+    }
+
+    @Test
     fun rejectsNamesThatCouldEscapeRootScripts() {
         assertFalse(ChrootClient.isValidName(""))
         assertFalse(ChrootClient.isValidName("-ubuntu"))
