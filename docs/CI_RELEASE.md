@@ -1,7 +1,7 @@
 # CI 打包与发布
 
-GitLab 和 GitHub 都采用手动运行模式。`main` 表示 latest，正式版本使用与 APK
-`versionName` 一致的不可变 `vX.Y.Z` Tag。
+GitLab 采用手动运行模式，GitHub 采用自动触发并保留手动重跑入口。`main` 表示滚动
+latest，正式版本使用与 APK `versionName` 一致的不可变 `vX.Y.Z` Tag。
 
 ## Release 签名变量
 
@@ -33,13 +33,17 @@ Release keystore 不得放入仓库、Job Artifact 或 Release 附件。GitLab �
 GitLab Runner 使用 Docker Executor 和固定 Android SDK 35 镜像，不需要 privileged
 模式或 Docker-in-Docker。
 
-## GitHub 手动构建
+## GitHub 自动发布
 
-进入 `Actions`：
+- 推送 `main`：自动运行 `Android Latest`，完成签名构建后将 `latest` Tag 移动到本次
+  提交，并覆盖上传 latest APK 与 SHA-256。该 Release 标记为预发布，不会取代正式版本。
+- 推送 `vX.Y.Z` Tag：自动运行 `Android Release`，校验 Tag 与 APK 版本一致后创建正式
+  GitHub Release，并将其标记为最新正式版本。
+- 两个工作流都保留 `Run workflow` 手动入口。`Android Latest` 始终重新构建 `main`；
+  `Android Release` 需要输入已经推送的 `vX.Y.Z` Tag，适合失败后重跑。
 
-- `Android Latest`：点击 `Run workflow`，始终从 `main` 构建 latest Artifact。
-- `Android Release`：点击 `Run workflow`，输入已经推送的 `vX.Y.Z` Tag。工作流会
-  校验 Tag 与 APK 版本，上传 Actions Artifact，并创建或更新 GitHub Release。
+`latest` 是唯一允许移动和覆盖的 Tag。`vX.Y.Z` 正式版本 Tag 不可修改，也不应删除后
+重新创建。
 
 正式 Release 同时包含：
 
@@ -63,7 +67,8 @@ git push origin vX.Y.Z
 ```
 
 一个 `git push` 会依次推送两个服务器，但跨服务器无法保证原子性。如果其中一个服务
-不可用，修复连接后重新执行相同命令即可。
+不可用，修复连接后重新执行相同命令即可。GitHub 收到 `main` 或 `vX.Y.Z` 后会自动
+发布；GitLab 不会自动运行 Pipeline，仍需在网页中手动启动。
 
 ## 本地等价验证
 

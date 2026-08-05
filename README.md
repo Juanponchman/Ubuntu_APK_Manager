@@ -6,16 +6,16 @@
 
 ## 下载
 
-- [下载最新 ARM64 APK](https://github.com/sqmxhd/Ubuntu_APK_Manager/releases/latest/download/UbuntuManager-latest-arm64-v8a.apk)
+- [下载最新 ARM64 APK](https://github.com/sqmxhd/Ubuntu_APK_Manager/releases/download/latest/UbuntuManager-latest-arm64-v8a.apk)
 - [查看全部正式版本与 SHA-256](https://github.com/sqmxhd/Ubuntu_APK_Manager/releases)
 
-正式版本由手动触发的 GitHub Actions 使用固定 Release 密钥签名，同时提供
-`UbuntuManager-latest-arm64-v8a.apk` 和带版本号的 APK。当前仅支持 ARM64 设备。
+`main` 每次推送后由 GitHub Actions 自动更新 latest APK；`vX.Y.Z` Tag 会自动发布正式
+版本。所有 Release APK 均使用固定密钥签名，当前仅支持 ARM64 设备。
 
 ## 界面预览
 
-| 实例管理 | 实例详情与主要操作 |
-| :---: | :---: |
+|                      实例管理                      |                       实例详情与主要操作                       |
+| :------------------------------------------------: | :------------------------------------------------------------: |
 | ![Root Chroot 实例列表](docs/images/instances.jpg) | ![Ubuntu 实例详情与主要操作](docs/images/instance-details.jpg) |
 
 ## 架构
@@ -50,8 +50,8 @@ Ubuntu 24.04 / OpenSSH / tmux / ttyd / Nmap
 目标真机已验证豆包输入法的语音转文字、剪贴板拆词选词以及删除键清空操作；输入法组合文本
 和选区替换会按 Android IME 状态同步到终端。
 
-| Root Chroot 本地终端 | 豆包输入法真机验证 |
-| :---: | :---: |
+|                    Root Chroot 本地终端                     |                    豆包输入法真机验证                     |
+| :---------------------------------------------------------: | :-------------------------------------------------------: |
 | ![带有终端快捷键的本地会话](docs/images/local-terminal.jpg) | ![豆包输入法在本地终端中输入](docs/images/doubao-ime.jpg) |
 
 <p align="center">
@@ -126,10 +126,11 @@ Root Chroot 实例与旧数据没有交叉。
 ./gradlew test assembleDebug
 ```
 
-仓库同时提供纯手动运行的 GitLab Docker Runner 与 GitHub Actions 工作流。日常构建在
-`main` 分支生成 latest 产物；正式发布使用与 `versionName` 一致的不可变 `vX.Y.Z` Tag，
-自动完成测试、Lint、Release 签名、签名验证和 SHA-256 生成。Release keystore 只通过
-CI Secrets 注入，不保存在 Git 中。详细配置与操作见 [CI 打包与发布](docs/CI_RELEASE.md)。
+仓库同时提供纯手动运行的 GitLab Docker Runner 与自动运行的 GitHub Actions 工作流。
+推送 `main` 会更新滚动 latest Release；推送与 `versionName` 一致的不可变 `vX.Y.Z` Tag
+会创建正式 Release。两种流程都会自动完成测试、Lint、Release 签名、签名验证和
+SHA-256 生成。Release keystore 只通过 CI Secrets 注入，不保存在 Git 中。详细配置与
+操作见 [CI 打包与发布](docs/CI_RELEASE.md)。
 
 最低 Android 8（API 26），当前 APK 面向 ARM64，目标设备验证环境为 Redmi K20 Pro /
 Android 11 / Magisk Alpha。

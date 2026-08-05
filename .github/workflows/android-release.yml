@@ -1,6 +1,9 @@
 name: Android Release
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -12,20 +15,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: android-release-${{ inputs.release_tag }}
+  group: android-release-${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
   cancel-in-progress: false
 
 jobs:
   release:
     name: Build and publish signed release APK
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
     permissions:
       contents: write
     steps:
       - name: Check out release tag
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - name: Set up Java 17
@@ -46,12 +51,12 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: scripts/ci/package-android.sh release "${{ inputs.release_tag }}"
+        run: scripts/ci/package-android.sh release "$RELEASE_TAG"
 
       - name: Preserve release build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: UbuntuManager-${{ inputs.release_tag }}
+          name: UbuntuManager-${{ env.RELEASE_TAG }}
           path: dist/
           if-no-files-found: error
           retention-days: 90
@@ -59,7 +64,6 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/*.apk dist/*.apk.sha256 --clobber
